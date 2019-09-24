@@ -36,19 +36,20 @@
 #include "SkipLayerNormPlugin.hpp"
 #include "QKVToContextPlugin.hpp"
 #include "EmbedPosition.hpp"
-
 #include "InstanceNormalization.hpp"
 
-
 #include <numeric> // For std::iota
-#include <iostream>
+#include <algorithm> // For std::min, std::max
+#include <sstream> // For std::stringstream
 
 namespace onnx2trt {
 
 namespace {
 
-enum { BATCH_DIM = 0 };
-bool debug_on = false;
+// In ONNX, the 0th dimension is the batch dimension.
+// In our TRT network, we strip this dimension where applicable.
+constexpr int BATCH_DIM = 0;
+bool debug_on = true;
 
 //sds-temp, add print plugin
 
@@ -71,8 +72,13 @@ nvinfer1::ITensor* add_print_plugin(IImporterContext* ctx, ::ONNX_NAMESPACE::Nod
     }
     return layer->getOutput(0);
 }
-
-
+inline nvinfer1::Dims makeDims(int nbDims, int val)
+{
+    nvinfer1::Dims dims;
+    dims.nbDims = nbDims;
+    std::fill_n(dims.d, nbDims, val);
+    return dims;
+}
 
 // Returns false if the transpose does not require any data movement (i.e., it's equivalent to a reshape)
 bool is_transpose_required(nvinfer1::Dims const& shape,
@@ -83,12 +89,12 @@ bool is_transpose_required(nvinfer1::Dims const& shape,
     int src_i = perm.order[dst_i];
     if( shape.d[src_i] != 1 ) {
       if( src_i < prev_significant_dim ) {
-        return false;
+        return true;
       }
       prev_significant_dim = src_i;
     }
   }
-  return true;
+  return false;
 }
 
 // Note: perm should not include the batch dim
@@ -102,17 +108,16 @@ transpose_tensor(IImporterContext* ctx,
     return nullptr;
   }
   nvinfer1::Dims shape = tensor.getDimensions();
-  // Check if we need to transpose the data
-  if( !is_transpose_required(shape, perm) ) {
+  // If a transpose is required, add transpose property to the shuffle layer.
+  if( is_transpose_required(shape, perm) ) {
     layer->setFirstTranspose(perm);
   }
-  // Transpose can be simplified to be a reshape if no data re-ordering is required.
+  // Else, the transpose can be simplified to a reshape.
   else
   {
     nvinfer1::Dims new_shape;
     new_shape.nbDims = shape.nbDims;
-    for (int i = 0; i < new_shape.nbDims; i++)
-    {
+    for( int i=0; i<new_shape.nbDims; ++i ) {
       new_shape.d[i] = shape.d[perm.order[i]];
     }
     layer->setReshapeDimensions(new_shape);
@@ -140,21 +145,6 @@ move_tensor_dimension(IImporterContext* ctx,
 }
 
 nvinfer1::ITensor*
-reshape_tensor(IImporterContext* ctx,
-               nvinfer1::ITensor& tensor,
-               nvinfer1::Dims shape) {
-  if( shape == tensor.getDimensions() ) {
-    return &tensor;
-  }
-  nvinfer1::IShuffleLayer* layer = ctx->network()->addShuffle(tensor);
-  if( !layer ) {
-    return nullptr;
-  }
-  layer->setReshapeDimensions(shape);
-  return layer->getOutput(0);
-}
-
-nvinfer1::ITensor*
 flatten_tensor(IImporterContext* ctx,
                nvinfer1::ITensor& tensor,
                int axis=0) {
@@ -175,6 +165,7 @@ NodeImportResult unaryHelper(IImporterContext* ctx,
     return {{layer->getOutput(0)}};
 }
 
+// float* is the poor man's std::optional<float>
 NodeImportResult activationHelper(IImporterContext* ctx,
     const ::ONNX_NAMESPACE::NodeProto& node, std::vector<TensorOrWeights>& inputs, nvinfer1::ActivationType op, float* alpha = nullptr, float* beta = nullptr)
 {
@@ -198,17 +189,7 @@ nvinfer1::IConstantLayer* addConstantScalar(IImporterContext* ctx, ScalarType sc
 {
     ShapedWeights scalarWeights = ctx->createTempWeights(type, nvinfer1::Dims{0});
     static_cast<ScalarType*>(scalarWeights.values)[0] = scalar;
-
-    #if 0
-    //sds-temp×ª³Éfloat
-    ShapedWeights::DataType _type = (int32_t)::ONNX_NAMESPACE::TensorProto::FLOAT;
-    
-    auto newW = ctx->createTempWeights(_type, scalarWeights.shape);
-    bool ret = onnx2trt::getNewWeights(scalarWeights, newW);
-    
-    return ctx->network()->addConstant(newW.shape, newW);
-	#endif
-	return ctx->network()->addConstant(scalarWeights.shape, scalarWeights);
+    return ctx->network()->addConstant(scalarWeights.shape, scalarWeights);
 }
 
 NodeImportResult
@@ -220,9 +201,10 @@ addScale(IImporterContext*   ctx,
          nvinfer1::Weights   power) {
   nvinfer1::ITensor* tensor_ptr = &tensor_;
   nvinfer1::Dims dims = tensor_ptr->getDimensions();
-#if NV_TENSORRT_MAJOR >= 4
-  bool need_to_expand_dims = (dims.nbDims != 3);
-  nvinfer1::Dims orig_shape = dims;
+
+  // TRT supports 2D or 3D scale, others need expand dims and add shuffle layers.
+  const bool need_to_expand_dims = (dims.nbDims != 3 && dims.nbDims != 4);
+  const nvinfer1::Dims orig_shape = dims;
   if( need_to_expand_dims ) {
     // Expand or squash dims to 3D
     nvinfer1::Dims new_shape = dims;
@@ -236,9 +218,9 @@ addScale(IImporterContext*   ctx,
     ASSERT(tensor_ptr, ErrorCode::kUNSUPPORTED_NODE);
     dims = tensor_ptr->getDimensions();
   }
-#endif // NV_TENSORRT_MAJOR >= 4
 
-  ASSERT(dims.nbDims == 3, ErrorCode::kUNSUPPORTED_NODE);
+  const int nbSpatialDims = dims.nbDims - 1;
+  ASSERT((nbSpatialDims == 2 || nbSpatialDims == 3), ErrorCode::kUNSUPPORTED_NODE);
   // Fill in dtype for any unused (dummy) weights
   nvinfer1::DataType* dtype_ptr = nullptr;
   if( shift.count ) {
@@ -258,18 +240,16 @@ addScale(IImporterContext*   ctx,
   shift.type = *dtype_ptr;
   scale.type = *dtype_ptr;
   power.type = *dtype_ptr;
-  auto* layer = ctx->network()->addScale(
-      *tensor_ptr, mode, shift, scale, power);
+  auto* layer = ctx->network()->addScaleNd(
+      *tensor_ptr, mode, shift, scale, power, tensor_ptr->getDimensions().nbDims - nbSpatialDims - 1);
   ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
   tensor_ptr = layer->getOutput(0);
 
-#if NV_TENSORRT_MAJOR >= 4
   if( need_to_expand_dims ) {
     // Un-expand spatial dims back to 1D
     tensor_ptr = reshape_tensor(ctx, *tensor_ptr, orig_shape);
     ASSERT(tensor_ptr, ErrorCode::kUNSUPPORTED_NODE);
   }
-#endif // NV_TENSORRT_MAJOR >= 4
   return {{tensor_ptr}};
 }
 
@@ -328,52 +308,48 @@ combineTensorsElementwise(IImporterContext* ctx,
                           nvinfer1::ElementWiseOperation binary_op,
                           bool legacy_binary_op_broadcasting=false) {
   ASSERT(!inputs.empty(), ErrorCode::kINVALID_NODE);
-  if (ctx->getOpsetVersion() < 7 && legacy_binary_op_broadcasting) {
+  if (ctx->getOpsetVersion() < 7 && legacy_binary_op_broadcasting)
+  {
     ASSERT(inputs.size() == 2, ErrorCode::kINTERNAL_ERROR);
     TRT_CHECK(applyLegacyBinaryOpBroadcasting(ctx, node, inputs[0], inputs[1]));
   }
   std::vector<nvinfer1::ITensor*> input_tensors;
   int ndim_max = -1;
   int tensors_ndim_max = -1;
-  for( auto input : inputs ) {
+  for (auto input : inputs)
+  {
     ndim_max = std::max(ndim_max, input.shape().nbDims);
     // Note: Tensor dims always exclude the batch dim, but weights may not
-    if( input.is_tensor() ) {
+    if(input.is_tensor())
+    {
       tensors_ndim_max = std::max(tensors_ndim_max, input.shape().nbDims);
     }
   }
-  for( auto input : inputs ) {
+  for (auto input : inputs)
+  {
     nvinfer1::ITensor* tensor_ptr;
-#if NV_TENSORRT_MAJOR < 4
-    ASSERT(input.is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-    tensor_ptr = &input.tensor();
-#else
-    if( input.is_weights() ) {
+    if( input.is_weights() )
+    {
       auto weights = input.weights();
       // Note: TRT supports broadcasting, but ranks must match
-      if( input.shape().nbDims < ndim_max ) {
+      if( input.shape().nbDims < ndim_max )
+      {
         weights.shape = expand_dims(weights.shape, ndim_max);
       }
-      if (weights.shape.nbDims == tensors_ndim_max + 1) {
+      if (weights.shape.nbDims == tensors_ndim_max + 1)
+      {
         // The weights contain a batch dim, which must be removed
         // Note: TRT Constant layer has implicit batch dim of 1
-           ASSERT(weights.shape.d[BATCH_DIM] == 1, ErrorCode::kUNSUPPORTED_NODE);
+        ASSERT(weights.shape.d[BATCH_DIM] == 1, ErrorCode::kUNSUPPORTED_NODE);
         weights.shape = remove_dim(weights.shape, BATCH_DIM);
       }
-#if 0
-      //sds-temp×ª³Éfloat
-      ShapedWeights::DataType _type = (int32_t)::ONNX_NAMESPACE::TensorProto::FLOAT;
-
-      auto newW = ctx->createTempWeights(_type, weights.shape);
-      bool ret = onnx2trt::getNewWeights(weights, newW);
-
-      
-      auto* layer = ctx->network()->addConstant(newW.shape, newW);
-#endif
+      // Add a constant layer to convert weights to tensor.
       auto* layer = ctx->network()->addConstant(weights.shape, weights);
       ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
       tensor_ptr = layer->getOutput(0);
-    } else {
+    }
+    else
+    {
       tensor_ptr = &input.tensor();
       // Support broadcasting for tensor inputs by expanding dimensions.
       if (tensor_ptr->getDimensions().nbDims != tensors_ndim_max)
@@ -383,8 +359,7 @@ combineTensorsElementwise(IImporterContext* ctx,
       }
       ASSERT(tensor_ptr->getDimensions().nbDims == tensors_ndim_max,
              ErrorCode::kUNSUPPORTED_NODE);
-     }
-#endif
+    }
     input_tensors.push_back(tensor_ptr);
   }
 #if 1
@@ -596,18 +571,17 @@ combineTensorsMyElementwise(IImporterContext* ctx,
     return outputs;
 }
 //End added by shendasai, 20190815
-
-
-// Note: As of TRT 4, ElementWise + Constant is preferred over Scale layer
-#if NV_TENSORRT_MAJOR < 4
 Status check_broadcast_attrs(IImporterContext* ctx, OnnxAttrs const& attrs,
-                             nvinfer1::Dims const& dims) {
-  if (ctx->getOpsetVersion() < 7) {
+                             nvinfer1::Dims const& dims)
+{
+  if (ctx->getOpsetVersion() < 7)
+  {
     ASSERT(attrs.count("broadcast"), ErrorCode::kUNSUPPORTED_NODE);
     bool broadcast = attrs.get<int>("broadcast");
     ASSERT(broadcast || dims.nbDims == 1, ErrorCode::kINVALID_NODE);
     int axis = attrs.get<int>("axis", -1);
-    TRT_CHECK(convert_axis(axis, dims.nbDims));
+    int nbDims = dims.nbDims;
+    TRT_CHECK(convert_axis(axis, nbDims));
     ASSERT(axis == 0, ErrorCode::kUNSUPPORTED_NODE);
   }
   return Status::success();
@@ -621,33 +595,38 @@ enum ScaleOp {
 
 NodeImportResult importScaleOp(IImporterContext* ctx,
                                ::ONNX_NAMESPACE::NodeProto const& node,
-                               TensorOrWeights& input0,
-                               TensorOrWeights& input1,
+                               std::vector<TensorOrWeights>& inputs,
                                ScaleOp op) {
-  auto* tensor_ptr = (input0.is_tensor() ?
-                      &input0.tensor() :
-                      &input1.tensor());
-  auto weights = (input0.is_weights() ?
-                        input0.weights() :
-                        input1.weights());
+  nvinfer1::ITensor* tensor_ptr = (inputs.at(0).is_tensor() ?
+                                  &inputs.at(0).tensor() :
+                                  &inputs.at(1).tensor());
+  ShapedWeights weights = (inputs.at(0).is_weights() ?
+                          inputs.at(0).weights() :
+                          inputs.at(1).weights());
   nvinfer1::Dims dims = tensor_ptr->getDimensions();
   // Note: ONNX opset >= 7 uses Numpy-style broadcasting, so dims are padded
   // at the end with ones for broadcasting.
   weights.shape = squeeze_trailing_dims(weights.shape);
-  nvinfer1::ScaleMode mode = get_scale_mode(weights.shape);
-  if( mode == nvinfer1::ScaleMode::kELEMENTWISE ) {
-    // TODO: TRT doesn't support including the batch dim in elementwise,
-    //       but we can't do a more specific assertion here yet because
-    //       the input tensor's shape may have been padded to WAR TRT's
-    //       shape issues.
-    ASSERT(get_shape_size(weights.shape) == get_shape_size(dims),
-           ErrorCode::kUNSUPPORTED_NODE);
-  } else if( mode == nvinfer1::ScaleMode::kCHANNEL ) {
-    OnnxAttrs attrs(node);
-    // TRT does not currently support full broadcasting
-    TRT_CHECK(check_broadcast_attrs(ctx, attrs, dims));
-    ASSERT(weights.shape.d[0] == dims.d[0],
-           ErrorCode::kUNSUPPORTED_NODE);
+  nvinfer1::ScaleMode mode = get_scale_mode(weights.shape, dims);
+  if (mode == nvinfer1::ScaleMode::kELEMENTWISE)
+  {
+    nvinfer1::ElementWiseOperation elementwise_op = {};
+    switch (op)
+    {
+      case kSHIFT: elementwise_op = nvinfer1::ElementWiseOperation::kSUM; break;
+      case kSCALE: elementwise_op = nvinfer1::ElementWiseOperation::kPROD; break;
+      case kPOWER: elementwise_op = nvinfer1::ElementWiseOperation::kPOW; break;
+    }
+    // If shapes do not entirely match up, an elementwise layer is needed instead
+    // to support full broadcasting.
+    if (get_shape_size(weights.shape) != get_shape_size(dims))
+    {
+      return combineTensorsElementwise(ctx,
+                          node,
+                          inputs,
+                          elementwise_op,
+                          true);
+    }
   }
   nvinfer1::Weights shift_weights = {};
   nvinfer1::Weights scale_weights = {};
@@ -660,7 +639,6 @@ NodeImportResult importScaleOp(IImporterContext* ctx,
   return addScale(
       ctx, *tensor_ptr, mode, shift_weights, scale_weights, power_weights);
 }
-#endif // NV_TENSORRT_MAJOR < 4
 
 } // namespace
 
@@ -668,8 +646,6 @@ string_map<NodeImporter>& getBuiltinOpImporterMap() {
   static string_map<NodeImporter> builtin_op_importers;
   return builtin_op_importers;
 }
-
-
 
 namespace {
 
@@ -679,8 +655,6 @@ bool registerBuiltinOpImporter(std::string op,
   assert(inserted);
   return inserted;
 }
-
-
 
 #define IGNORE_UNUSED_GLOBAL(x) \
   static void _ignore_unused2_##x(); \
@@ -716,18 +690,17 @@ bool registerBuiltinOpImporter(std::string op,
   return {{output}}; \
 } while(0)
 
-#if NV_TENSORRT_MAJOR >= 4
 // Helper for ArgMax/ArgMin
 NodeImportResult argMinMaxHelper(IImporterContext* ctx,
     const ::ONNX_NAMESPACE::NodeProto& node, std::vector<TensorOrWeights>& inputs, nvinfer1::TopKOperation op)
 {
-    ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-    nvinfer1::ITensor& tensor = inputs.at(0).tensor();
+    nvinfer1::ITensor& tensor = convertToTensor(inputs.at(0), ctx);
     ASSERT(tensor.getType() != nvinfer1::DataType::kINT32, ErrorCode::kUNSUPPORTED_NODE);
     // Get attributes.
     OnnxAttrs attrs(node);
     int keepdims = attrs.get("keepdims", 1);
     int axis = attrs.get("axis", 0);
+
     int nbDims = tensor.getDimensions().nbDims;
     // Adjust axis to TensorRT format
     TRT_CHECK(convert_axis(axis, nbDims));
@@ -761,7 +734,6 @@ NodeImportResult argMinMaxHelper(IImporterContext* ctx,
         return {{squeezeLayer->getOutput(0)}};
     }
 }
-#endif // #if NV_TENSORRT_MAJOR >= 4
 
 DEFINE_BUILTIN_OP_IMPORTER(Abs) {
   return apply_unary_function(ctx, inputs.at(0), nvinfer1::UnaryOperation::kABS);
@@ -776,14 +748,17 @@ DEFINE_BUILTIN_OP_IMPORTER(Acosh)
 {
     return unaryHelper(ctx, node, inputs, nvinfer1::UnaryOperation::kACOSH);
 }
-#if 1
+
 DEFINE_BUILTIN_OP_IMPORTER(Add) {
-  ASSERT(inputs.size() == 2, ErrorCode::kINVALID_NODE);
+  if (inputs.at(0).is_tensor() != inputs.at(1).is_tensor())   
+  {   
+      return importScaleOp(   
+          ctx, node, inputs, ScaleOp::kSHIFT);    
+  }
   return combineTensorsElementwise(
       ctx, node, inputs, nvinfer1::ElementWiseOperation::kSUM, true);
 }
-#endif
-#if NV_TENSORRT_MAJOR >= 4
+
 DEFINE_BUILTIN_OP_IMPORTER(ArgMax)
 {
     return argMinMaxHelper(ctx, node, inputs, nvinfer1::TopKOperation::kMAX);
@@ -793,8 +768,6 @@ DEFINE_BUILTIN_OP_IMPORTER(ArgMin)
 {
     return argMinMaxHelper(ctx, node, inputs, nvinfer1::TopKOperation::kMIN);
 }
-#endif // #if NV_TENSORRT_MAJOR >= 4
-
 
 DEFINE_BUILTIN_OP_IMPORTER(Asin)
 {
@@ -817,12 +790,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Atanh)
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(AveragePool) {
-  // TensorRT 5.1 only supports up to opset 9.
-  ASSERT(ctx->getOpsetVersion() < 10, ErrorCode::kUNSUPPORTED_NODE);
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor* tensor_ptr = &inputs.at(0).tensor();
+  nvinfer1::ITensor* tensor_ptr = &convertToTensor(inputs.at(0), ctx);
   nvinfer1::Dims dims = tensor_ptr->getDimensions();
-#if NV_TENSORRT_MAJOR >= 4
   bool need_to_expand_dims = (dims.nbDims == 2);
   if( need_to_expand_dims ) {
     // Expand spatial dims from 1D to 2D
@@ -831,12 +800,26 @@ DEFINE_BUILTIN_OP_IMPORTER(AveragePool) {
     ASSERT(tensor_ptr, ErrorCode::kUNSUPPORTED_NODE);
     dims = tensor_ptr->getDimensions();
   }
-#endif // NV_TENSORRT_MAJOR >= 4
+
+  // Support for opset10 ceil_mode
+  CeilingPoolDim ceilingPool;
+  // Ceiling and dialations added in opset 10
+  if (ctx->getOpsetVersion() >= 10)
+  {
+    OnnxAttrs attrs(node);
+    const auto ceil_mode = attrs.get<int>("ceil_mode", 0);
+    const auto dilations = attrs.get<std::vector<int>>("dilations", std::vector<int> (2, 1));
+    for(size_t i = 0; i < dilations.size(); i++) ASSERT(dilations[i] == 1, ErrorCode::kUNSUPPORTED_NODE); // Do not support pooling dilations currently
+    if (ceil_mode != 0) // Need to set pooling formula to use ceiling instead of floor
+    {
+      ctx->network()->setPoolingOutputDimensionsFormula(&ceilingPool);
+    }
+  }
+
   ASSERT(dims.nbDims == 3, ErrorCode::kUNSUPPORTED_NODE);
   nvinfer1::DimsHW kernel_size(1, 1), strides(1, 1), beg_padding(0, 0), end_padding(0, 0);
   nvinfer1::PaddingMode paddingMode;
-  get_kernel_params(node, get_DimsHW_from_CHW(dims),
-                    &kernel_size, &strides, &beg_padding, &end_padding, paddingMode);
+  get_kernel_params(node, &kernel_size, &strides, &beg_padding, &end_padding, paddingMode);
   nvinfer1::IPoolingLayer* pooling_layer = ctx->network()->addPooling(
     *tensor_ptr, nvinfer1::PoolingType::kAVERAGE, kernel_size);
   nvinfer1::ILayer* layer = pooling_layer;
@@ -868,24 +851,22 @@ DEFINE_BUILTIN_OP_IMPORTER(AveragePool) {
   }
   tensor_ptr = layer->getOutput(0);
   dims = tensor_ptr->getDimensions();
-#if NV_TENSORRT_MAJOR >= 4
   if( need_to_expand_dims ) {
     // Un-expand spatial dims back to 1D
     nvinfer1::Dims new_shape{2, {dims.d[0], dims.d[1]}};
     tensor_ptr = reshape_tensor(ctx, *tensor_ptr, new_shape);
     ASSERT(tensor_ptr, ErrorCode::kUNSUPPORTED_NODE);
   }
-#endif // NV_TENSORRT_MAJOR >= 4
   return {{tensor_ptr}};
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(BatchNormalization) {
-  ASSERT(inputs.at(0).is_tensor(),  ErrorCode::kUNSUPPORTED_NODE);
+  // Scale, bias, mean, and variance must be initializers
   ASSERT(inputs.at(1).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
   ASSERT(inputs.at(2).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
   ASSERT(inputs.at(3).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
   ASSERT(inputs.at(4).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor& tensor = inputs.at(0).tensor();
+  nvinfer1::ITensor& tensor = convertToTensor(inputs.at(0), ctx);
   auto scale_weights    = inputs.at(1).weights();
   auto bias_weights     = inputs.at(2).weights();
   auto mean_weights     = inputs.at(3).weights();
@@ -925,38 +906,29 @@ DEFINE_BUILTIN_OP_IMPORTER(BatchNormalization) {
                   combined_bias_weights, combined_scale_weights, {});
 }
 
-DEFINE_BUILTIN_OP_IMPORTER(Ceil) {
-   return unaryHelper(ctx, node, inputs, nvinfer1::UnaryOperation::kCEIL);
-}
-
-//sds-check
-//faiseq ÓÃÁËÒ»´Î£¬×ªInt32
-//ºÜÆæ¹Ö£¬Õâ¸öÊµÏÖ²¢²»ÄÜÊ¹µÃÊäÈëÊä³öµÄÊý¾ÝÀàÐÍ¸Ä±ä¡£¶øÊÇÖ»Ñ¡ÔñÁË¾«¶È  
 DEFINE_BUILTIN_OP_IMPORTER(Cast) {
-//sds-temp, do nothing
 #if 0
-    // Get input node.
-    ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
     OnnxAttrs attrs(node);
-    // Check if datatype casted to is valid.
-    nvinfer1::DataType dtype = nvinfer1::DataType::kFLOAT;
-    ASSERT(convert_dtype(attrs.get<int32_t>("to"), &dtype), ErrorCode::kUNSUPPORTED_NODE);
-    //sds,²»Ö§³ÖINT32²Ù×÷£¬×ª³É16
-    //sds-temp,Ä¿Ç°Ö»ÔÚnonzeroºóÃæ»á×ßµ½¡ 0~127£int16¹»ÓÃÁË¡£
-    if(dtype == nvinfer1::DataType::kINT32)
-        dtype = nvinfer1::DataType::kFLOAT;
+    // Get data type to cast to.
+    auto cast_dtype = attrs.get<int32_t>("to");
+    auto * tensor_ptr = &convertToTensor(inputs.at(0), ctx);
+    auto trt_dtype = tensor_ptr->getType();
+    // TensorRT only supports the following conversion: FP16 -> FP32.
+    ASSERT(trt_dtype == nvinfer1::DataType::kHALF && cast_dtype == ::ONNX_NAMESPACE::TensorProto::FLOAT,
+          ErrorCode::kUNSUPPORTED_NODE);
     // Add the layer.
     nvinfer1::IIdentityLayer* layer = ctx->network()->addIdentity(inputs.at(0).tensor());
-    layer->setPrecision(dtype);
-
-    //layer->setOutputType(0, nvinfer1::DataType::kINT8);
+    layer->setPrecision(nvinfer1::DataType::kFLOAT);
     RETURN_FIRST_OUTPUT(layer);
 #endif
     return inputs;
 }
 
+DEFINE_BUILTIN_OP_IMPORTER(Ceil) {
+   return unaryHelper(ctx, node, inputs, nvinfer1::UnaryOperation::kCEIL);
+}
+
 DEFINE_BUILTIN_OP_IMPORTER(Clip) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
   OnnxAttrs attrs(node);
   // beta is the upper bound.
   float alpha = attrs.get("min", std::numeric_limits<float>::lowest());
@@ -1006,36 +978,27 @@ DEFINE_BUILTIN_OP_IMPORTER(Concat) {
       return {{newWeights}};
   }
   //End:added by shendasai ,2019-8-23
-
-  
   std::vector<nvinfer1::ITensor*> tensors;
   for( auto& input : inputs ) {
-    ASSERT(input.is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-#if NV_TENSORRT_MAJOR >= 4
+    nvinfer1::ITensor* tensor_ptr = &convertToTensor(input, ctx);
     ASSERT(input.tensor().getType() != nvinfer1::DataType::kINT32,
            ErrorCode::kUNSUPPORTED_NODE);
-#endif // NV_TENSORRT_MAJOR >= 4
-    tensors.push_back(&input.tensor());
+    tensors.push_back(tensor_ptr);
   }
-
-  
   OnnxAttrs attrs(node);
-  int nbDims = inputs.at(0).shape().nbDims;
   int axis = attrs.get<int>("axis");
+  int nbDims = inputs.at(0).shape().nbDims;
   TRT_CHECK(convert_axis(axis, nbDims));
   auto* layer = ctx->network()->addConcatenation(tensors.data(), tensors.size());
   ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
   layer->setAxis(axis);
-  if(debug_on)
-    return {{add_print_plugin(ctx, node,layer->getOutput(0))}};
-  else
-    RETURN_FIRST_OUTPUT(layer);
+  RETURN_FIRST_OUTPUT(layer);
 }
-//sds,²¢Ã»ÓÐµ÷ÓÃtensorrtµÄconstant layer£¬¶øÊÇÖ±½Ó·µ»ØÁËÒ»¸öTensorOrWeight
+
 DEFINE_BUILTIN_OP_IMPORTER(Constant) {
-  // TODO: This silently fails if the dtype is not supported
-  OnnxAttrs attrs(node);
-  return {{attrs.get<ShapedWeights>("value")}};
+    // TODO: This silently fails if the dtype is not supported
+    OnnxAttrs attrs(node);
+    return {{attrs.get<ShapedWeights>("value")}};
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(ConstantOfShape) {
@@ -1319,15 +1282,13 @@ DEFINE_BUILTIN_OP_IMPORTER(EmbedPosition)
     else
      RETURN_FIRST_OUTPUT(layer2);
 }
-
 DEFINE_BUILTIN_OP_IMPORTER(Conv) {
-    ASSERT(inputs.at(0).is_tensor(),  ErrorCode::kUNSUPPORTED_NODE);
+    // Convolution weights must be an initializer
     ASSERT(inputs.at(1).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
 
-    nvinfer1::ITensor* tensor_ptr = &inputs.at(0).tensor();
+    nvinfer1::ITensor* tensor_ptr = &convertToTensor(inputs.at(0), ctx);
     auto kernel_weights = inputs.at(1).weights();
     nvinfer1::Dims dims = tensor_ptr->getDimensions();
-    #if NV_TENSORRT_MAJOR >= 4
     bool need_to_expand_dims = (dims.nbDims == 2);
     if( need_to_expand_dims ) {
         // Expand spatial dims from 1D to 2D
@@ -1340,9 +1301,10 @@ DEFINE_BUILTIN_OP_IMPORTER(Conv) {
         kernel_weights.shape.nbDims = 4;
         kernel_weights.shape.d[3] = 1;
     }
-    #endif // NV_TENSORRT_MAJOR >= 4
-    ASSERT(dims.nbDims == 3, ErrorCode::kUNSUPPORTED_NODE);
-    ASSERT(kernel_weights.shape.nbDims == 4, ErrorCode::kUNSUPPORTED_NODE);
+    const int nbSpatialDims = dims.nbDims - 1;
+    ASSERT((nbSpatialDims == 2 && kernel_weights.shape.nbDims == 4) ||
+      (nbSpatialDims == 3 && kernel_weights.shape.nbDims == 5), ErrorCode::kUNSUPPORTED_NODE); //NOW only support 2D/3D
+
     nvinfer1::Weights bias_weights;
     if( inputs.size() == 3 ) {
         ASSERT(inputs.at(2).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
@@ -1353,52 +1315,54 @@ DEFINE_BUILTIN_OP_IMPORTER(Conv) {
     } else {
         bias_weights = ShapedWeights::empty(kernel_weights.type);
     }
-    nvinfer1::DimsHW kernel_size;
-    kernel_size.h() = kernel_weights.shape.d[2];
-    kernel_size.w() = kernel_weights.shape.d[3];
-    nvinfer1::DimsHW strides(1, 1);
-    nvinfer1::DimsHW beg_padding(0, 0), end_padding(0, 0);
-    nvinfer1::DimsHW dilations(1, 1);
+    nvinfer1::Dims kernel_size;
+    kernel_size.nbDims = nbSpatialDims;
+    for(int i = 1; i <= nbSpatialDims; ++i){
+      kernel_size.d[nbSpatialDims - i] = kernel_weights.shape.d[kernel_weights.shape.nbDims - i];
+    }
+    nvinfer1::Dims strides = makeDims(nbSpatialDims, 1);
+    nvinfer1::Dims beg_padding = makeDims(nbSpatialDims, 0);
+    nvinfer1::Dims end_padding = makeDims(nbSpatialDims, 0);
+    nvinfer1::Dims dilations = makeDims(nbSpatialDims, 1);
     nvinfer1::PaddingMode paddingMode;
-    get_kernel_params(node, get_DimsHW_from_CHW(dims), &kernel_size,
-        &strides, &beg_padding, &end_padding, paddingMode, &dilations);
-    ASSERT(kernel_size.h() == kernel_weights.shape.d[2], ErrorCode::kINVALID_NODE);
-    ASSERT(kernel_size.w() == kernel_weights.shape.d[3], ErrorCode::kINVALID_NODE);
+    get_kernel_params(node, &kernel_size, &strides, &beg_padding, &end_padding, paddingMode, &dilations);
+
+    for(int i = 1; i <= nbSpatialDims; ++i){
+      ASSERT(kernel_size.d[nbSpatialDims - i] == kernel_weights.shape.d[kernel_weights.shape.nbDims - i], ErrorCode::kUNSUPPORTED_NODE);
+    }
+
     int nchan = dims.d[0];
     int noutput = kernel_weights.shape.d[0]; // Note: Weights order is KCRS
-    nvinfer1::IConvolutionLayer* layer = ctx->network()->addConvolution(
+    nvinfer1::IConvolutionLayer* layer = ctx->network()->addConvolutionNd(
         *tensor_ptr, noutput, kernel_size, kernel_weights, bias_weights);
 
     ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
-    layer->setStride(strides);
+    layer->setStrideNd(strides);
     layer->setPaddingMode(paddingMode);
     layer->setPrePadding(beg_padding);
     layer->setPostPadding(end_padding);
-    layer->setDilation(dilations);
+    layer->setDilationNd(dilations);
     OnnxAttrs attrs(node);
     int ngroup = attrs.get("group", 1);
     ASSERT(kernel_weights.shape.d[1] * ngroup == nchan, ErrorCode::kINVALID_NODE);
     layer->setNbGroups(ngroup);
     tensor_ptr = layer->getOutput(0);
     dims = tensor_ptr->getDimensions();
-    #if NV_TENSORRT_MAJOR >= 4
     if( need_to_expand_dims ) {
         // Un-expand spatial dims back to 1D
         nvinfer1::Dims new_shape{2, {dims.d[0], dims.d[1]}};
         tensor_ptr = reshape_tensor(ctx, *tensor_ptr, new_shape);
         ASSERT(tensor_ptr, ErrorCode::kUNSUPPORTED_NODE);
     }
-    #endif // NV_TENSORRT_MAJOR >= 4
     return {{tensor_ptr}};
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(ConvTranspose) {
-  ASSERT(inputs.at(0).is_tensor(),  ErrorCode::kUNSUPPORTED_NODE);
+  // Deconvolution weights must be an initializer
   ASSERT(inputs.at(1).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor* tensor_ptr = &inputs.at(0).tensor();
+  nvinfer1::ITensor* tensor_ptr = &convertToTensor(inputs.at(0), ctx);
   auto kernel_weights = inputs.at(1).weights();
   nvinfer1::Dims dims = tensor_ptr->getDimensions();
-#if NV_TENSORRT_MAJOR >= 4
   bool need_to_expand_dims = (dims.nbDims == 2);
   if( need_to_expand_dims ) {
     // Expand spatial dims from 1D to 2D
@@ -1411,9 +1375,10 @@ DEFINE_BUILTIN_OP_IMPORTER(ConvTranspose) {
     kernel_weights.shape.nbDims = 4;
     kernel_weights.shape.d[3] = 1;
   }
-#endif // NV_TENSORRT_MAJOR >= 4
-  ASSERT(dims.nbDims == 3, ErrorCode::kUNSUPPORTED_NODE);
-  ASSERT(kernel_weights.shape.nbDims == 4, ErrorCode::kUNSUPPORTED_NODE);
+  const int nbSpatialDims = dims.nbDims - 1;
+  // TensorRT supports 2D and 3D deconvolutions
+  ASSERT((nbSpatialDims == 2 && kernel_weights.shape.nbDims == 4) ||
+    (nbSpatialDims == 3 && kernel_weights.shape.nbDims == 5), ErrorCode::kUNSUPPORTED_NODE);
   nvinfer1::Weights bias_weights;
   if( inputs.size() == 3 ) {
     ASSERT(inputs.at(2).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
@@ -1426,58 +1391,58 @@ DEFINE_BUILTIN_OP_IMPORTER(ConvTranspose) {
     bias_weights = ShapedWeights::empty(kernel_weights.type);
   }
   OnnxAttrs attrs(node);
-  nvinfer1::DimsHW input_shape = get_DimsHW_from_CHW(dims);
-  nvinfer1::DimsHW output_shape;
+  nvinfer1::Dims output_shape;
   if( attrs.count("output_shape") ) {
-    output_shape = attrs.get<nvinfer1::DimsHW>("output_shape");
+    output_shape = attrs.get<nvinfer1::Dims>("output_shape");
   } else {
-    ASSERT(attrs.get("auto_pad", std::string("VALID")) == "VALID",
+    ASSERT(attrs.get("auto_pad", std::string("VALID")) == "VALID" || attrs.get("auto_pad", std::string("NOTSET")) == "NOTSET" ,
            ErrorCode::kINVALID_NODE);
   }
-  nvinfer1::DimsHW kernel_size;
-  kernel_size.h() = kernel_weights.shape.d[2];
-  kernel_size.w() = kernel_weights.shape.d[3];
-  nvinfer1::DimsHW strides(1, 1);
-  nvinfer1::DimsHW beg_padding(0, 0), end_padding(0, 0);
-  nvinfer1::DimsHW dilations(1, 1);
+  nvinfer1::Dims kernel_size;
+  kernel_size.nbDims = nbSpatialDims;
+  for(int i = 1; i <= nbSpatialDims; ++i){
+    kernel_size.d[nbSpatialDims - i] =  kernel_weights.shape.d[kernel_weights.shape.nbDims - i];
+  }
+  nvinfer1::Dims strides = makeDims(nbSpatialDims, 1);
+  nvinfer1::Dims beg_padding = makeDims(nbSpatialDims, 0);
+  nvinfer1::Dims end_padding = makeDims(nbSpatialDims, 0);
+  nvinfer1::Dims dilations = makeDims(nbSpatialDims, 1);
   nvinfer1::PaddingMode paddingMode;
   // Note: output_shape/input_shape are swapped here so that the padding
   //       calculations operate as if it were a regular forward convolution.
-  get_kernel_params(node, output_shape,
-                    &kernel_size, &strides,
-                    &beg_padding, &end_padding, paddingMode, &dilations, &input_shape);
-  ASSERT(kernel_size.h() == kernel_weights.shape.d[2], ErrorCode::kINVALID_NODE);
-  ASSERT(kernel_size.w() == kernel_weights.shape.d[3], ErrorCode::kINVALID_NODE);
-  ASSERT(dims.nbDims == 3, ErrorCode::kUNSUPPORTED_NODE);
+  get_kernel_params(node, &kernel_size, &strides, &beg_padding, &end_padding, paddingMode, &dilations);
+  for(int i = 1; i <= nbSpatialDims; ++i){
+    ASSERT(kernel_size.d[nbSpatialDims - i] == kernel_weights.shape.d[kernel_weights.shape.nbDims - i], ErrorCode::kUNSUPPORTED_NODE);
+    ASSERT(dilations.d[nbSpatialDims - i] == 1, ErrorCode::kUNSUPPORTED_GRAPH);
+  }
+
   int nchan = dims.d[0];
   int ngroup = attrs.get("group", 1);
   int noutput = kernel_weights.shape.d[1] * ngroup; // Note: Weights order is CKRS
-  nvinfer1::IDeconvolutionLayer* deconv_layer = ctx->network()->addDeconvolution(
+  nvinfer1::IDeconvolutionLayer* deconv_layer = ctx->network()->addDeconvolutionNd(
     *tensor_ptr, noutput, kernel_size, kernel_weights, bias_weights);
   nvinfer1::ILayer* layer = deconv_layer;
   ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
-  deconv_layer->setStride(strides);
+  deconv_layer->setStrideNd(strides);
   if( !attrs.count("output_shape") && attrs.count("output_padding") ) {
-    auto output_padding = attrs.get<nvinfer1::DimsHW>("output_padding");
-    end_padding.h() -= output_padding.h();
-    end_padding.w() -= output_padding.w();
+    auto output_padding = attrs.get<nvinfer1::Dims>("output_padding");
+    for (int i = 1; i <= nbSpatialDims; ++i){
+      end_padding.d[nbSpatialDims - i] -= end_padding.d[nbSpatialDims - i];
+    }
   }
   deconv_layer->setPaddingMode(paddingMode);
   deconv_layer->setPrePadding(beg_padding);
   deconv_layer->setPostPadding(end_padding);
-  ASSERT(dilations.h() == 1 && dilations.w() == 1, ErrorCode::kUNSUPPORTED_NODE);
   ASSERT(kernel_weights.shape.d[0] == nchan, ErrorCode::kINVALID_NODE);
   deconv_layer->setNbGroups(ngroup);
   tensor_ptr = layer->getOutput(0);
   dims = tensor_ptr->getDimensions();
-#if NV_TENSORRT_MAJOR >= 4
   if( need_to_expand_dims ) {
     // Un-expand spatial dims back to 1D
     nvinfer1::Dims new_shape{2, {dims.d[0], dims.d[1]}};
     tensor_ptr = reshape_tensor(ctx, *tensor_ptr, new_shape);
     ASSERT(tensor_ptr, ErrorCode::kUNSUPPORTED_NODE);
   }
-  #endif // NV_TENSORRT_MAJOR >= 4
   return {{tensor_ptr}};
 }
 
@@ -1491,11 +1456,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Cosh)
     return unaryHelper(ctx, node, inputs, nvinfer1::UnaryOperation::kCOSH);
 }
 
-
-#if NV_TENSORRT_MAJOR >= 4
 DEFINE_BUILTIN_OP_IMPORTER(DepthToSpace) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor* tensor_ptr = &inputs.at(0).tensor();
+  nvinfer1::ITensor* tensor_ptr = &convertToTensor(inputs.at(0), ctx);
   nvinfer1::IShuffleLayer* layer = ctx->network()->addShuffle(*tensor_ptr);
   ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
   OnnxAttrs attrs(node);
@@ -1531,26 +1493,25 @@ DEFINE_BUILTIN_OP_IMPORTER(DepthToSpace) {
   ASSERT(tensor_ptr, ErrorCode::kUNSUPPORTED_NODE);
   return {{tensor_ptr}};
 }
-#endif // NV_TENSORRT_MAJOR >= 4
 
 DECLARE_BUILTIN_OP_IMPORTER(Mul);
 DEFINE_BUILTIN_OP_IMPORTER(Div) {
   ASSERT(inputs.size() == 2, ErrorCode::kINVALID_NODE);
   return combineTensorsElementwise(
-      ctx, node, inputs, nvinfer1::ElementWiseOperation::kDIV, true);
+    ctx, node, inputs, nvinfer1::ElementWiseOperation::kDIV, true);
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(Dropout) {
-  // TensorRT 5.1 only supports up to opset 9.
-  ASSERT(ctx->getOpsetVersion() < 10, ErrorCode::kUNSUPPORTED_NODE);
   int noutputs = node.output().size();
   if (noutputs == 1)
   {
     RETURN_IDENTITY(inputs.at(0));
   }
-  else 
+  else
   {
-    // Return both Dropout outputs: (output + mask)
+    // Error if opset version >= 10 as boolean tensors are not supported
+    ASSERT(ctx->getOpsetVersion() < 10, ErrorCode::kUNSUPPORTED_NODE);
+    // Add identity layer twice for both Dropout outputs: (output + mask)
     std::vector<TensorOrWeights> outputs;
     outputs.push_back(identity(ctx,inputs.at(0)));
     outputs.push_back(identity(ctx,inputs.at(0)));
@@ -1575,19 +1536,16 @@ DEFINE_BUILTIN_OP_IMPORTER(Flatten) {
   //       operation, because we can't remove or merge into the batch dim.
   ASSERT(axis == 1, ErrorCode::kUNSUPPORTED_NODE);
   nvinfer1::Dims dims = inputs.at(0).shape();
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor* tensor_ptr;
-#if NV_TENSORRT_MAJOR < 4
-  // Note: TRT3 requires that the shape remain 3D (CHW)
-  tensor_ptr = flatten_tensor(ctx, inputs.at(0).tensor());
-#else // NV_TENSORRT_MAJOR >= 4
+  nvinfer1::ITensor* tensor_ptr = &convertToTensor(inputs.at(0), ctx);
   nvinfer1::Dims new_shape{1, {(int)get_shape_size(dims)}};
-  tensor_ptr = reshape_tensor(ctx, inputs.at(0).tensor(), new_shape);
-#endif // NV_TENSORRT_MAJOR >= 4
+  tensor_ptr = reshape_tensor(ctx, *tensor_ptr, new_shape);
   ASSERT(tensor_ptr, ErrorCode::kUNSUPPORTED_NODE);
   return {{tensor_ptr}};
 }
 
+DEFINE_BUILTIN_OP_IMPORTER(Floor) {
+    return unaryHelper(ctx, node, inputs, nvinfer1::UnaryOperation::kFLOOR);
+}
 
 bool  gather_scalar(IImporterContext* ctx, std::vector<TensorOrWeights>& inputs, ShapedWeights& newWeights)
 {
@@ -1663,13 +1621,7 @@ bool  gather_scalar(IImporterContext* ctx, std::vector<TensorOrWeights>& inputs,
 
     return true;
 }
-
-  
-
-//sds-check
-#if NV_TENSORRT_MAJOR >= 4
 DEFINE_BUILTIN_OP_IMPORTER(Gather) {
-
     //Begin: added by shendasai for output is scalar case, 2019Äê8ÔÂ23ÈÕ14:03:19.
     bool isOutScalar =false;
     ShapedWeights newWeights;
@@ -1679,11 +1631,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Gather) {
         return {{newWeights}};
     }
     //End: added by shendasai for output is scalar case.
-
-    //Èç¹ûÊäÈëÊÇ
     nvinfer1::ITensor& data = convertToTensor(inputs.at(0), ctx);
     nvinfer1::ITensor& indices = convertToTensor(inputs.at(1), ctx);
-    //Èç¹ûindicesÊÇfloatÀàÐÍ£¬×ª»¯Îªint32ÀàÐÍ
     #if 1
     nvinfer1::ILayer* layer_ptr = ctx->addPluginV2Ext(
         new MyCastPlugin(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT32),
@@ -1694,20 +1643,12 @@ DEFINE_BUILTIN_OP_IMPORTER(Gather) {
     OnnxAttrs attrs(node);
     int axis = attrs.get<int>("axis", 0);
     int nbDims = inputs.at(0).shape().nbDims;
-    //sds-temp 
-    //(1)embeding (2)shape (3)ÆäËü  µÄÊä³ö²»Òªº¬ÓÐbatch
-    //axis +=1;
     TRT_CHECK(convert_axis(axis, nbDims));
-    //sds
     RETURN_FIRST_OUTPUT(ctx->network()->addGather(data, *indices_new, axis));
 }
-#endif // NV_TENSORRT_MAJOR >= 4
 
-DEFINE_BUILTIN_OP_IMPORTER(Floor) {
-    return unaryHelper(ctx, node, inputs, nvinfer1::UnaryOperation::kFLOOR);
-}
-
-DEFINE_BUILTIN_OP_IMPORTER(Gemm) {
+DEFINE_BUILTIN_OP_IMPORTER(Gemm)
+{
     OnnxAttrs attrs(node);
     float alpha = attrs.get("alpha", 1.f);
     float beta = attrs.get("beta", 1.f);
@@ -1758,11 +1699,6 @@ DEFINE_BUILTIN_OP_IMPORTER(Gemm) {
         inputB = &inputs.at(1).tensor();
     }
 
-    if (ctx->getOpsetVersion() < 7)
-    {
-        ASSERT(attrs.get("broadcast", false), ErrorCode::kUNSUPPORTED_NODE);
-    }
-
     nvinfer1::ITensor* inputASqueezed = &inputA;
     nvinfer1::Dims newDims = squeeze_trailing_dims(inputA.getDimensions());
     // When A has more than 2 dimensions, it needs to be flattened.
@@ -1780,21 +1716,24 @@ DEFINE_BUILTIN_OP_IMPORTER(Gemm) {
 
     constexpr auto getMatrixOp = [] (const nvinfer1::ITensor& input, bool transpose)
     {
-        return (input.getDimensions().nbDims == 1) ?
-        nvinfer1::MatrixOperation::kVECTOR :
-        (transpose) ?
-        nvinfer1::MatrixOperation::kTRANSPOSE :
-        nvinfer1::MatrixOperation::kNONE;
+        if (input.getDimensions().nbDims == 1)
+        {
+            return nvinfer1::MatrixOperation::kVECTOR;
+        }
+        else if (transpose)
+        {
+            return nvinfer1::MatrixOperation::kTRANSPOSE;
+        }
+        return nvinfer1::MatrixOperation::kNONE;
     };
 
     nvinfer1::MatrixOperation opA = getMatrixOp(*inputASqueezed, transA);
     nvinfer1::MatrixOperation opB = getMatrixOp(*inputB, transB);
 
-
     if (opA == nvinfer1::MatrixOperation::kVECTOR && opB == nvinfer1::MatrixOperation::kVECTOR)
-    {
-      ASSERT(inputASqueezed->getDimensions() == inputB->getDimensions(), ErrorCode::kUNSUPPORTED_NODE);
-    }
+    {   
+        ASSERT(inputASqueezed->getDimensions() == inputB->getDimensions(), ErrorCode::kUNSUPPORTED_NODE);   
+    }    
 
     nvinfer1::IMatrixMultiplyLayer* matmul = ctx->network()->addMatrixMultiply(*inputASqueezed, opA, *inputB, opB);
     nvinfer1::ITensor* matmulTensor = matmul->getOutput(0);
@@ -1803,6 +1742,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Gemm) {
     if (alpha != 1.f)
     {
         nvinfer1::IConstantLayer* alphaConstant = addConstantScalar(ctx, alpha, ::ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+        nvinfer1::ITensor* alphaConstantTensor = alphaConstant->getOutput(0);
+        broadcast_tensors(ctx, alphaConstantTensor, matmulTensor);
         nvinfer1::IElementWiseLayer* scaledMatmul = ctx->network()->addElementWise(*alphaConstant->getOutput(0), *matmulTensor, nvinfer1::ElementWiseOperation::kPROD);
         matmulTensor = scaledMatmul->getOutput(0);
     }
@@ -1811,16 +1752,25 @@ DEFINE_BUILTIN_OP_IMPORTER(Gemm) {
     if (beta != 1.f)
     {
         nvinfer1::IConstantLayer* betaConstant = addConstantScalar(ctx, beta, ::ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+        nvinfer1::ITensor* betaConstantTensor = betaConstant->getOutput(0);
+        broadcast_tensors(ctx, betaConstantTensor, biasTensor);
         nvinfer1::IElementWiseLayer* scaledBias = ctx->network()->addElementWise(*betaConstant->getOutput(0), *biasTensor, nvinfer1::ElementWiseOperation::kPROD);
         biasTensor = scaledBias->getOutput(0);
     }
 
-    RETURN_FIRST_OUTPUT(ctx->network()->addElementWise(*matmulTensor, *biasTensor, nvinfer1::ElementWiseOperation::kSUM));
+    // A*B may be lower rank than C in TRT, so need to squeeze C.
+    if (ctx->getOpsetVersion() < 7 && !attrs.get("broadcast", false))
+    {
+        nvinfer1::Dims squeezeDims = squeeze_leading_dims(biasTensor->getDimensions());
+        biasTensor = reshape_tensor(ctx, *biasTensor, squeezeDims);
+    }
+    broadcast_tensors(ctx, matmulTensor, biasTensor);
+    nvinfer1::IElementWiseLayer* biasAdd = ctx->network()->addElementWise(*matmulTensor, *biasTensor, nvinfer1::ElementWiseOperation::kSUM);
+    return {{biasAdd->getOutput(0)}};
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(GlobalAveragePool) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor& tensor = inputs.at(0).tensor();
+  nvinfer1::ITensor& tensor = convertToTensor(inputs.at(0), ctx);
   nvinfer1::Dims dims = tensor.getDimensions();
   ASSERT(dims.nbDims == 3, ErrorCode::kUNSUPPORTED_NODE);
   nvinfer1::DimsHW kernel_size(dims.d[1], dims.d[2]);
@@ -1832,8 +1782,7 @@ DEFINE_BUILTIN_OP_IMPORTER(GlobalAveragePool) {
 // TODO: GlobalLpPool: pow(reduce_mean(pow(abs(x), p)), 1./p)
 
 DEFINE_BUILTIN_OP_IMPORTER(GlobalMaxPool) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor& tensor = inputs.at(0).tensor();
+  nvinfer1::ITensor& tensor = convertToTensor(inputs.at(0), ctx);
   nvinfer1::Dims dims = tensor.getDimensions();
   ASSERT(dims.nbDims == 3, ErrorCode::kUNSUPPORTED_NODE);
   nvinfer1::DimsHW kernel_size(dims.d[1], dims.d[2]);
@@ -1843,7 +1792,6 @@ DEFINE_BUILTIN_OP_IMPORTER(GlobalMaxPool) {
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(HardSigmoid) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
   OnnxAttrs attrs(node);
   float alpha = attrs.get<float>("alpha", 0.2f);
   float beta  = attrs.get<float>("beta",  0.5f);
@@ -1855,7 +1803,6 @@ DEFINE_BUILTIN_OP_IMPORTER(Identity) {
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(ImageScaler) {
-    ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
     OnnxAttrs attrs{node};
     // Shift the input by a per-channel bias value.
     std::vector<float> biases = attrs.get<std::vector<float>>("bias");
@@ -1868,28 +1815,29 @@ DEFINE_BUILTIN_OP_IMPORTER(ImageScaler) {
     std::fill(static_cast<float*>(scaleWeights.values), static_cast<float*>(scaleWeights.values) + scaleWeights.count(), scale);
     // Finally add the scale layer.
     RETURN_FIRST_OUTPUT(
-        ctx->network()->addScale(inputs.at(0).tensor(), nvinfer1::ScaleMode::kCHANNEL,
+        ctx->network()->addScale(convertToTensor(inputs.at(0), ctx), nvinfer1::ScaleMode::kCHANNEL,
             shiftWeights, scaleWeights, nvinfer1::Weights{})
     );
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(InstanceNormalization) {
-  ASSERT(inputs.at(0).is_tensor(),  ErrorCode::kUNSUPPORTED_NODE);
+  // Scale and bias must initializers
   ASSERT(inputs.at(1).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
   ASSERT(inputs.at(2).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
   auto scale_weights = inputs.at(1).weights();
   auto bias_weights  = inputs.at(2).weights();
   OnnxAttrs attrs(node);
   float epsilon = attrs.get("epsilon", 1e-5f);
-  // HACK TODO: Values < ~1e-4 were found to cause corrupt output in a RTST model. Need to suss this out.
+  // Lock maximum epsilon value to 1e-4f
   epsilon = std::max(epsilon, 1e-4f);
   RETURN_FIRST_OUTPUT(
       ctx->addPluginV2(
         new InstanceNormalizationPlugin(epsilon, scale_weights, bias_weights),
-        {&inputs.at(0).tensor()}));
+        {&convertToTensor(inputs.at(0), ctx)}));
 }
 
-DEFINE_BUILTIN_OP_IMPORTER(LeakyRelu) {
+DEFINE_BUILTIN_OP_IMPORTER(LeakyRelu)
+{
     OnnxAttrs attrs(node);
     float alpha = attrs.get<float>("alpha", 0.01f);
     return activationHelper(ctx, node, inputs, nvinfer1::ActivationType::kLEAKY_RELU, &alpha);
@@ -1911,8 +1859,7 @@ DEFINE_BUILTIN_OP_IMPORTER(LogSoftmax) {
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(LRN) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor& tensor = inputs.at(0).tensor();
+  nvinfer1::ITensor& tensor = convertToTensor(inputs.at(0), ctx);
   OnnxAttrs attrs(node);
   int   size  = attrs.get<int>("size");
   float alpha = attrs.get<float>("alpha", 0.0001f);
@@ -1980,6 +1927,10 @@ DEFINE_BUILTIN_OP_IMPORTER(MatMul) {
     else
         return {{layer_ptr->getOutput(0)}}; 
     
+	#if 0
+	nvinfer1::IMatrixMultiplyLayer* matmul = ctx->network()->addMatrixMultiply(inputA, opA, inputB, opB);
+    return {{matmul->getOutput(0)}};
+	#endif
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(Max) {
@@ -1988,13 +1939,10 @@ DEFINE_BUILTIN_OP_IMPORTER(Max) {
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(MaxPool) {
-  // TensorRT 5.1 only supports up to opset 9.
-  ASSERT(ctx->getOpsetVersion() < 10, ErrorCode::kUNSUPPORTED_NODE);
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor* tensor_ptr = &inputs.at(0).tensor();
+  nvinfer1::ITensor* tensor_ptr = &convertToTensor(inputs.at(0), ctx);
   nvinfer1::Dims dims = tensor_ptr->getDimensions();
   ASSERT(dims.nbDims >= 2, ErrorCode::kINVALID_NODE);
-#if NV_TENSORRT_MAJOR >= 4
+
   bool need_to_expand_dims = (dims.nbDims == 2);
   if( need_to_expand_dims ) {
     // Expand spatial dims from 1D to 2D
@@ -2003,33 +1951,50 @@ DEFINE_BUILTIN_OP_IMPORTER(MaxPool) {
     ASSERT(tensor_ptr, ErrorCode::kUNSUPPORTED_NODE);
     dims = tensor_ptr->getDimensions();
   }
-#endif // NV_TENSORRT_MAJOR >= 4
-  ASSERT(dims.nbDims == 3, ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::DimsHW kernel_size(1, 1), strides(1, 1), beg_padding(0, 0), end_padding(0, 0);
+
+  // Support for opset10 ceil_mode
+  CeilingPoolDim ceilingPool;
+  // Ceiling and dialations added in opset 10
+  if (ctx->getOpsetVersion() >= 10)
+  {
+    OnnxAttrs attrs(node);
+    const auto ceil_mode = attrs.get<int>("ceil_mode", 0);
+    const auto dilations = attrs.get<std::vector<int>>("dilations", std::vector<int> (2, 1));
+    for(size_t i = 0; i < dilations.size(); i++) ASSERT(dilations[i] == 1, ErrorCode::kUNSUPPORTED_NODE); // Do not support pooling dilations currently
+    if (ceil_mode != 0) // Need to set pooling formula to use ceiling instead of floor
+    {
+      ctx->network()->setPoolingOutputDimensionsFormula(&ceilingPool);
+    }
+  }
+
+  int nbSpatialDims = dims.nbDims - 1;
+  ASSERT(nbSpatialDims == 2 || nbSpatialDims == 3, ErrorCode::kUNSUPPORTED_NODE);
+  nvinfer1::Dims kernel_size = makeDims(nbSpatialDims, 1);
+  nvinfer1::Dims strides = makeDims(nbSpatialDims, 1);
+  nvinfer1::Dims beg_padding = makeDims(nbSpatialDims, 0);
+  nvinfer1::Dims end_padding = makeDims(nbSpatialDims, 0);
   nvinfer1::PaddingMode paddingMode;
-  get_kernel_params(node, get_DimsHW_from_CHW(dims),
+  get_kernel_params(node,
                     &kernel_size, &strides, &beg_padding, &end_padding, paddingMode);
-  nvinfer1::IPoolingLayer* layer = ctx->network()->addPooling(
+  nvinfer1::IPoolingLayer* layer = ctx->network()->addPoolingNd(
     *tensor_ptr, nvinfer1::PoolingType::kMAX, kernel_size);
   ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
-  layer->setStride(strides);
+  layer->setStrideNd(strides);
   layer->setPaddingMode(paddingMode);
   layer->setPrePadding(beg_padding);
   layer->setPostPadding(end_padding);
   tensor_ptr = layer->getOutput(0);
   dims = tensor_ptr->getDimensions();
-#if NV_TENSORRT_MAJOR >= 4
+
   if( need_to_expand_dims ) {
     // Un-expand spatial dims back to 1D
     nvinfer1::Dims new_shape{2, {dims.d[0], dims.d[1]}};
     tensor_ptr = reshape_tensor(ctx, *tensor_ptr, new_shape);
     ASSERT(tensor_ptr, ErrorCode::kUNSUPPORTED_NODE);
   }
-#endif // NV_TENSORRT_MAJOR >= 4
   return {{tensor_ptr}};
 }
 
-#if NV_TENSORRT_MAJOR >= 4
 DEFINE_BUILTIN_OP_IMPORTER(Mean) {
   auto sum_result = combineTensorsElementwise(
     ctx, node, inputs, nvinfer1::ElementWiseOperation::kSUM);
@@ -2054,13 +2019,11 @@ DEFINE_BUILTIN_OP_IMPORTER(Mean) {
       ctx->network()->addElementWise(
           sum_tensor, scale_constant, nvinfer1::ElementWiseOperation::kPROD));
 }
-#endif // NV_TENSORRT_MAJOR >= 4
 
 DEFINE_BUILTIN_OP_IMPORTER(Min) {
   return combineTensorsElementwise(
     ctx, node, inputs, nvinfer1::ElementWiseOperation::kMIN);
 }
-
 
 bool  mul_scalar(IImporterContext* ctx, std::vector<TensorOrWeights>& inputs, ShapedWeights& newWeights)
 {
@@ -2134,11 +2097,7 @@ bool  mul_scalar(IImporterContext* ctx, std::vector<TensorOrWeights>& inputs, Sh
 
     return true;
 }
-
-
-#if 1
 DEFINE_BUILTIN_OP_IMPORTER(Mul) {
-
   bool isScalar =false;
 
   //Begin:added by shendasai ,2019-8-23
@@ -2156,15 +2115,24 @@ DEFINE_BUILTIN_OP_IMPORTER(Mul) {
   ASSERT(inputs.size() == 2, ErrorCode::kINVALID_NODE);
   return combineTensorsElementwise(
       ctx, node, inputs, nvinfer1::ElementWiseOperation::kPROD, true);
-}
+#if 0
+  // Explicit precision networks need scale layer over elementwise
+  if (inputs.at(0).is_tensor() != inputs.at(1).is_tensor())
+  {
+    return importScaleOp(
+        ctx, node, inputs, ScaleOp::kSCALE);
+  }
+  return combineTensorsElementwise(
+      ctx, node, inputs, nvinfer1::ElementWiseOperation::kPROD, true);
 #endif
+}
+
 DEFINE_BUILTIN_OP_IMPORTER(Neg) {
   return apply_unary_function(ctx, inputs.at(0), nvinfer1::UnaryOperation::kNEG);
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(Pad) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor& tensor = inputs.at(0).tensor();
+  nvinfer1::ITensor& tensor = convertToTensor(inputs.at(0), ctx);
   nvinfer1::DimsHW beg_padding, end_padding;
   OnnxAttrs attrs(node);
   auto mode = attrs.get<std::string>("mode", "constant");
@@ -2198,67 +2166,87 @@ DEFINE_BUILTIN_OP_IMPORTER(Pad) {
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(ParametricSoftplus) {
-    ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
     OnnxAttrs attrs(node);
     float alpha = attrs.get<float>("alpha");
     float beta = attrs.get<float>("beta");
     return activationHelper(ctx, node, inputs, nvinfer1::ActivationType::kSOFTPLUS, &alpha, &beta);
 }
-#if 1
+
 DEFINE_BUILTIN_OP_IMPORTER(Pow) {
+
+  if (inputs.at(0).is_tensor() != inputs.at(1).is_tensor())
+  {
+    return importScaleOp(
+        ctx, node, inputs, ScaleOp::kPOWER);
+  }
   ASSERT(inputs.size() == 2, ErrorCode::kINVALID_NODE);
   return combineTensorsElementwise(
-      ctx, node, inputs, nvinfer1::ElementWiseOperation::kPOW, true);
+    ctx, node, inputs, nvinfer1::ElementWiseOperation::kPOW, true);
 }
-#endif
-// TODO: Prelu is currently ONLY supported with a constant scale factor, making it
-// identcal with LeakyRelu. Removing the op from the registry until it is fully supported.
 
-// DEFINE_BUILTIN_OP_IMPORTER(PRelu) {
-//   ASSERT(inputs.at(0).is_tensor(),  ErrorCode::kUNSUPPORTED_NODE);
-//   ASSERT(inputs.at(1).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
-//   ShapedWeights weights = inputs.at(1).weights();
-//   ASSERT(weights.type == ::ONNX_NAMESPACE::TensorProto::FLOAT,
-//          ErrorCode::kUNSUPPORTED_NODE);
-//   // TODO: Add support for per-channel scale factor
-//   nvinfer1::Dims scalar_shape{1, {1}};
-//   ASSERT(weights.shape == scalar_shape, ErrorCode::kUNSUPPORTED_NODE);
-//   float alpha = *reinterpret_cast<float const*>(weights.values);
-//   RETURN_FIRST_OUTPUT(
-//       ctx->addPluginV2(
-//          new FancyActivationPlugin(FancyActivationPlugin::LEAKY_RELU, alpha),
-//          {&inputs.at(0).tensor()}));
-// }
+DEFINE_BUILTIN_OP_IMPORTER(PRelu) {
+    ASSERT(inputs.size() == 2, ErrorCode::kINVALID_NODE);
+    nvinfer1::ITensor& input = convertToTensor(inputs.at(0), ctx);
+    const auto& shape1 = inputs.at(0).shape();
+    nvinfer1::ITensor* slopes{};
+    if (inputs.at(1).is_tensor())
+    {
+        const auto& shape2 = inputs.at(1).shape();
+        ASSERT(shape1.nbDims == shape2.nbDims, ErrorCode::kUNSUPPORTED_NODE);
+        for (int i = 0; i < shape1.nbDims; ++i)
+        {
+            ASSERT(shape1.d[i] == shape2.d[i] || shape2.d[i] == 1, ErrorCode::kUNSUPPORTED_NODE);
+        }
+        slopes = &convertToTensor(inputs.at(1), ctx);
+    }
+    else
+    {
+        auto weights = inputs.at(1).weights();
+        if (inputs.at(1).shape().nbDims < shape1.nbDims)
+        {
+            weights.shape = expand_dims(weights.shape, shape1.nbDims);
+        }
+        else if (inputs.at(1).shape().nbDims > shape1.nbDims)
+        {
+            weights.shape = remove_dim(weights.shape, BATCH_DIM);
+        }
+        auto constantLayer = ctx->network()->addConstant(weights.shape, weights);
+        ASSERT(constantLayer, ErrorCode::kUNSUPPORTED_NODE);
+        slopes = constantLayer->getOutput(0);
+    }
+    ASSERT(input.getType() != nvinfer1::DataType::kINT32, ErrorCode::kUNSUPPORTED_NODE);
+    ASSERT(slopes->getType() != nvinfer1::DataType::kINT32, ErrorCode::kUNSUPPORTED_NODE);
+    RETURN_FIRST_OUTPUT(ctx->network()->addParametricReLU(input, *slopes));
+}
 
 DEFINE_BUILTIN_OP_IMPORTER(Reciprocal) {
   return apply_unary_function(ctx, inputs.at(0), nvinfer1::UnaryOperation::kRECIP);
 }
 
-#if NV_TENSORRT_MAJOR >= 4
 NodeImportResult reduceTensor(IImporterContext* ctx,
                               ::ONNX_NAMESPACE::NodeProto const& node,
                               TensorOrWeights input,
                               nvinfer1::ReduceOperation operation) {
-  ASSERT(input.is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor& tensor = input.tensor();
-  OnnxAttrs attrs(node);
-  bool keepdims = attrs.get("keepdims", 1);
-  int ndim = tensor.getDimensions().nbDims;
-  std::vector<int> axes;
-  if( attrs.count("axes") ) {
-    axes = attrs.get<std::vector<int>>("axes");
-  } else {
-    axes.resize(ndim);
-    std::iota(axes.begin(), axes.end(), 0);
-  }
-  uint32_t axis_mask = 0;
-  for( int axis : axes ) {
-    // Adjust axis to TensorRT format
-    TRT_CHECK(convert_axis(axis, ndim));
-    axis_mask |= 1 << axis;
-  }
-  RETURN_FIRST_OUTPUT(
-      ctx->network()->addReduce(tensor, operation, axis_mask, keepdims));
+    nvinfer1::ITensor& tensor = convertToTensor(input, ctx);
+    OnnxAttrs attrs(node);
+    bool keepdims = attrs.get("keepdims", 1);
+    int ndim = tensor.getDimensions().nbDims;
+    std::vector<int> axes;
+    if( attrs.count("axes") ) {
+        axes = attrs.get<std::vector<int>>("axes");
+    } else {
+        axes.resize(ndim);
+        std::iota(axes.begin(), axes.end(), 0);
+    }
+
+    uint32_t axisMask = 0;
+    for (int axis : axes) {
+        TRT_CHECK(convert_axis(axis, ndim));
+        axisMask |= 1 << axis;
+    }
+
+    RETURN_FIRST_OUTPUT(
+        ctx->network()->addReduce(tensor, operation, axisMask, keepdims));
 }
 DEFINE_BUILTIN_OP_IMPORTER(ReduceL1) {
   NodeImportResult abs_result = apply_unary_function(
@@ -2310,7 +2298,6 @@ DEFINE_BUILTIN_OP_IMPORTER(ReduceProd) {
   return reduceTensor(ctx, node, inputs.at(0), nvinfer1::ReduceOperation::kPROD);
 }
 DEFINE_BUILTIN_OP_IMPORTER(ReduceSum) {
-
       //×ª³ÉfloatÀàÐÍ£¬elementwise²»Ö§³Öint32
   if(inputs.at(0).is_tensor())
   {
@@ -2340,13 +2327,9 @@ DEFINE_BUILTIN_OP_IMPORTER(ReduceSumSquare) {
       ctx, node, sqr_tensor_ptr, nvinfer1::ReduceOperation::kSUM);
 }
 
-#endif // NV_TENSORRT_MAJOR >= 4
-
-DEFINE_BUILTIN_OP_IMPORTER(Relu) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  RETURN_FIRST_OUTPUT(
-    ctx->network()->addActivation(
-      inputs.at(0).tensor(), nvinfer1::ActivationType::kRELU));
+DEFINE_BUILTIN_OP_IMPORTER(Relu)
+{
+    return activationHelper(ctx, node, inputs, nvinfer1::ActivationType::kRELU);
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(Reshape) {
@@ -2355,13 +2338,9 @@ DEFINE_BUILTIN_OP_IMPORTER(Reshape) {
   if( ctx->getOpsetVersion() >= 5 ) {
     ASSERT(inputs.size() == 2, ErrorCode::kINVALID_NODE);
     auto new_shape_input = inputs.at(1);
-    //sds-temp,ÊäÈëµÄshape±ØÐëÊÇweights¡£itensorÔÚ´´½¨engineÊ±ÖµÊÇ²»È·¶¨µÄ.
     ASSERT(new_shape_input.is_weights(), ErrorCode::kUNSUPPORTED_NODE);
-    {
-
-        ShapedWeights new_shape_weights = new_shape_input.weights();
-        ASSERT(new_shape_weights.shape.nbDims == 1, ErrorCode::kINVALID_NODE);
-
+    ShapedWeights new_shape_weights = new_shape_input.weights();
+    ASSERT(new_shape_weights.shape.nbDims == 1, ErrorCode::kINVALID_NODE);
         //if float, convert to int32
         if(new_shape_weights.type == ::ONNX_NAMESPACE::TensorProto::FLOAT)
         {
@@ -2379,94 +2358,61 @@ DEFINE_BUILTIN_OP_IMPORTER(Reshape) {
           bool ret = onnx2trt::newWghInt64ToInt(new_shape_weights, newW);
           if(ret)new_shape_weights = newW;
         }
-        
         ASSERT(new_shape_weights.type == ::ONNX_NAMESPACE::TensorProto::INT32,
                ErrorCode::kINVALID_NODE);
         int32_t const* new_shape_ptr =
           static_cast<int32_t const*>(new_shape_weights.values);
-        new_shape.nbDims = new_shape_weights.shape.d[0];
-        std::copy(new_shape_ptr, new_shape_ptr + new_shape.nbDims, new_shape.d);
-    }
+    new_shape.nbDims = new_shape_weights.shape.d[0];
+    std::copy(new_shape_ptr, new_shape_ptr + new_shape.nbDims, new_shape.d);
   } else {
     OnnxAttrs attrs(node);
     new_shape = attrs.get<nvinfer1::Dims>("shape");
   }
-    int infer_dim = -1;
-    //sds-temp, gatherÊä³öµÄscalar »á×ß½øÕâÀï
-    if( input.is_weights() ) {
-      auto weights = input.weights();
-      TRT_CHECK(get_infer_dim(infer_dim,new_shape));
-      if (infer_dim >= 0)
-      {
-        // Check that the -1 Dimension is correct.
-        ASSERT(get_shape_size(weights.shape) % (-1*get_shape_size(new_shape)) == 0,
-          ErrorCode::kINVALID_NODE);
-
-        // Update the dim to the correct value
-        int new_dim = get_shape_size(weights.shape) / (-1*get_shape_size(new_shape));
-        new_shape.d[infer_dim] = new_dim;
-        weights.shape = new_shape;
-        ASSERT(get_shape_size(new_shape) == get_shape_size(weights.shape),
-           ErrorCode::kUNSUPPORTED_NODE);
-        return {{weights}};
-      }
-      else
-      {
-        weights.shape = new_shape;
-        return {{weights}};
-      }
-    }
-    else
+  int infer_dim = -1;
+  if( input.is_weights() ) {
+    auto weights = input.weights();
+    TRT_CHECK(get_infer_dim(infer_dim,new_shape));
+    if (infer_dim >= 0)
     {
-      nvinfer1::ITensor& tensor = input.tensor();
-
+      // Update the dim to the correct value
+      int new_dim = get_shape_size(weights.shape) / (-1 * get_shape_size(new_shape));
+      new_shape.d[infer_dim] = new_dim;
+    }
+    ASSERT(get_shape_size(new_shape) == get_shape_size(weights.shape),
+           ErrorCode::kUNSUPPORTED_NODE);
+    weights.shape = new_shape;
+    return {{weights}};
+  }
+  else {
+    //new_shape = set_dims_CHW(remove_dim(new_shape, BATCH_DIM));
+    nvinfer1::ITensor& tensor = input.tensor();
       //sds-temp,modifyed by shendasai, ÊäÈëµÄÈ¨ÖØÒÑ¾­È¥µôbatch_dim
       //(1)shape(2)constant(3)concat
       //new_shape = set_dims_CHW(remove_dim(new_shape, BATCH_DIM));
       new_shape = set_dims_CHW(new_shape);
-      
       // Check for -1 dimension in new shape
       //¼ì²éÓÐÇÒÖ»ÄÜÓÐÒ»¸ö -1
-      TRT_CHECK(get_infer_dim(infer_dim,new_shape));
+    TRT_CHECK(get_infer_dim(infer_dim,new_shape));
+    if (infer_dim >= 0)
+    {
+      // Update the dim to the correct value
+      int new_dim = get_shape_size(tensor.getDimensions()) / (-1 * get_shape_size(new_shape));
+      new_shape.d[infer_dim] = new_dim;
+    }
 
-      //²»´æÔÚ-1
-      if (infer_dim < 0) {
-        //input[0]ºÍinput[1]µÄ´óÐ¡ÒªÒ»ÖÂ
-        //sds-temp, trtÄ¬ÈÏ²»Ö§³Öbroadcast
-        ASSERT(get_shape_size(new_shape) ==
-                   get_shape_size(tensor.getDimensions()),
-               ErrorCode::kUNSUPPORTED_NODE);
-      }
-#if NV_TENSORRT_MAJOR < 4
-      if( new_shape.nbDims == 1 ) {
-        // Note: TRT implicitly flattens the input to FC layers, and in fact
-        //       requires that it still has 4D shape, so in this case we
-        //       simply ignore the reshape.
-        RETURN_IDENTITY(inputs.at(0));
-      } else {
-        ASSERT(new_shape.nbDims == 3, ErrorCode::kUNSUPPORTED_NODE);
-        nvinfer1::IShuffleLayer* layer = ctx->network()->addShuffle(tensor);
-        ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
-        layer->setReshapeDimensions(new_shape);
-        ASSERT(get_shape_size(layer->getOutput(0)->getDimensions()) ==
-               get_shape_size(input.shape()), ErrorCode::kUNSUPPORTED_NODE);
-        RETURN_FIRST_OUTPUT(layer);
-      }
-#else // NV_TENSORRT_MAJOR >= 4
-      nvinfer1::IShuffleLayer* layer = ctx->network()->addShuffle(tensor);
-      ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
-      layer->setReshapeDimensions(new_shape);
-      ASSERT(get_shape_size(layer->getOutput(0)->getDimensions()) ==
-             get_shape_size(input.shape()), ErrorCode::kUNSUPPORTED_NODE);
+    ASSERT(get_shape_size(new_shape) == get_shape_size(tensor.getDimensions()),
+             ErrorCode::kUNSUPPORTED_NODE);
+    nvinfer1::IShuffleLayer* layer = ctx->network()->addShuffle(tensor);
+    ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
+    layer->setReshapeDimensions(new_shape);
+    ASSERT(get_shape_size(layer->getOutput(0)->getDimensions()) ==
+           get_shape_size(input.shape()), ErrorCode::kUNSUPPORTED_NODE);
       //RETURN_FIRST_OUTPUT(layer);
 
       if(debug_on)
         return {{add_print_plugin(ctx, node,layer->getOutput(0))}};
       else
         return {{layer->getOutput(0)}}; 
-
-    
-#endif // NV_TENSORRT_MAJOR >= 4
   }
 }
 
@@ -2511,7 +2457,6 @@ DEFINE_BUILTIN_OP_IMPORTER(Reshape) {
 //}
 
 DEFINE_BUILTIN_OP_IMPORTER(ScaledTanh) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
   OnnxAttrs attrs(node);
   float alpha = attrs.get<float>("alpha");
   float beta = attrs.get<float>("beta");
@@ -2519,22 +2464,18 @@ DEFINE_BUILTIN_OP_IMPORTER(ScaledTanh) {
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(Selu) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
   OnnxAttrs attrs(node);
   float alpha = attrs.get("alpha", 1.6732f);
   float beta = attrs.get("gamma", 1.0507f);
   return activationHelper(ctx, node, inputs, nvinfer1::ActivationType::kSELU, &alpha, &beta);
 }
 
-//sds:µ±Óöµ½shapeºó£¬»á·µ»ØÒ»¸öweights¡£²¢²»´´½¨layer¡£
 DEFINE_BUILTIN_OP_IMPORTER(Shape) {
-  //shape is Dims
   auto shape = inputs.at(0).shape();
   if( inputs.at(0).is_tensor() ) {
    //sds-delete, ²»À©Õ¹Î¬¶È£¬batch-sizeÕâÒ»Î¬¶ÈÔÝ²»ÌåÏÖ(shapeºóÃæ¸úgatherºÍexpand£¬¶¼²»ÐèÒªÌåÏÖ)
    //sds,Èô²»É¾£¬gatherµÄindictÐèÒª+1
    // shape = insert_dim(shape, BATCH_DIM, -1);
-   
   }
   nvinfer1::Dims weight_dims;
   weight_dims.nbDims = 1;
@@ -2549,21 +2490,9 @@ DEFINE_BUILTIN_OP_IMPORTER(Shape) {
   return {{weights}};
 }
 
-DEFINE_BUILTIN_OP_IMPORTER(Sigmoid) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  RETURN_FIRST_OUTPUT(
-    ctx->network()->addActivation(
-      inputs.at(0).tensor(), nvinfer1::ActivationType::kSIGMOID));
-}
-
-DEFINE_BUILTIN_OP_IMPORTER(Sin)
+DEFINE_BUILTIN_OP_IMPORTER(Sigmoid)
 {
-    return unaryHelper(ctx, node, inputs, nvinfer1::UnaryOperation::kSIN);
-}
-
-DEFINE_BUILTIN_OP_IMPORTER(Sinh)
-{
-    return unaryHelper(ctx, node, inputs, nvinfer1::UnaryOperation::kSINH);
+  return activationHelper(ctx, node, inputs, nvinfer1::ActivationType::kSIGMOID);
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(Size) {
@@ -2582,23 +2511,37 @@ DEFINE_BUILTIN_OP_IMPORTER(Size) {
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(Slice) {
-  // TensorRT 5.1 only supports up to opset 9.
-  ASSERT(ctx->getOpsetVersion() < 10, ErrorCode::kUNSUPPORTED_NODE);
   ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor& tensor = inputs.at(0).tensor();;
-  OnnxAttrs attrs(node);
-  const auto starts = attrs.get<std::vector<int64_t>>("starts");
-  const auto ends = attrs.get<std::vector<int64_t>>("ends");
-  auto axes = attrs.get<std::vector<int64_t>>("axes");
-  // If axes are empty, follow the ONNX spec and populate it with [0, 1, ..., len(starts) - 1]
-  if (axes.size() == 0)
+  // If opset version >= 10 slice paramerters are weights instead of attributes
+  nvinfer1::ITensor& tensor = inputs.at(0).tensor();
+  std::vector<int64_t> starts;
+  std::vector<int64_t> ends;
+  std::vector<int64_t> axes;
+  std::vector<int64_t> steps;
+  if(ctx->getOpsetVersion() >= 10)
   {
-    for (size_t i = 0; i < starts.size(); i++)
-    {
-      axes.push_back(i);
-    }
+    ASSERT(inputs.at(1).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
+    int64_t * array_start = static_cast<int64_t *>(inputs.at(1).weights().values);
+    starts = std::vector<int64_t> (array_start, array_start + inputs.at(1).weights().count());
+    ASSERT(inputs.at(2).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
+    array_start = static_cast<int64_t *>(inputs.at(2).weights().values);
+    ends = std::vector<int64_t> (array_start, array_start + inputs.at(2).weights().count());
+    ASSERT(inputs.at(3).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
+    array_start = static_cast<int64_t *>(inputs.at(3).weights().values);
+    axes = std::vector<int64_t> (array_start, array_start + inputs.at(3).weights().count());
+    ASSERT(inputs.at(4).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
+    array_start = static_cast<int64_t *>(inputs.at(4).weights().values);
+    steps = std::vector<int64_t> (array_start, array_start + inputs.at(4).weights().count());
   }
-  ASSERT(axes.size() == starts.size() && axes.size() == ends.size(), ErrorCode::kINVALID_VALUE);
+  else
+  {
+    OnnxAttrs attrs(node);
+    starts = attrs.get<std::vector<int64_t>>("starts");
+    ends = attrs.get<std::vector<int64_t>>("ends");
+    axes = attrs.get<std::vector<int64_t>>("axes");
+    steps = std::vector<int64_t>(starts.size(), 1);
+  }
+  ASSERT(axes.size() == starts.size() && axes.size() == ends.size() && axes.size() == steps.size(), ErrorCode::kINVALID_VALUE);
 
   const nvinfer1::Dims dims = tensor.getDimensions();
   const int nbDims = dims.nbDims;
@@ -2608,42 +2551,75 @@ DEFINE_BUILTIN_OP_IMPORTER(Slice) {
     return result;
   };
   nvinfer1::Dims sliceStart = makeDims(0);
+  nvinfer1::Dims sliceEnd = dims;
   nvinfer1::Dims sliceSize = dims;
-  const nvinfer1::Dims sliceStride = makeDims(1); // ONNX has no support for strides in Slice
+  nvinfer1::Dims sliceStride = makeDims(1); // ONNX has support for strides before opset 10
   for (size_t i = 0; i < axes.size(); i++){
+
     int axis = axes[i];
-    if (axis == 0) {
-      // We can only check that starts is properly 0
-      // but can't check end as we don't know batch size
-      ASSERT(starts[i] == 0, ErrorCode::kINVALID_VALUE);
-      std::cerr << "Warning: slice with starts=0 on batch axis is ignored" << std::endl;
+    // Special pass through for no-ops (slice across the whole dimension, [:])
+    if (starts[i] == 0 && ends[i] >= dims.d[i] && steps[i] == 1)
+    {
       continue;
     }
-    TRT_CHECK(convert_axis(axis, nbDims));
-    int dim = dims.d[axis];
-    int start = starts[i] >= 0 ? starts[i] : dim + starts[i];
-    int end = ends[i] >= 0 ? ends[i] : dim + ends[i];
-    sliceStart.d[axis] = start;
-    sliceSize.d[axis] = end < dim ? end - start : dim - start;
-  }
 
+    // Convert the axis if it passes the no-op check, we catch actual slices across batch dimension here
+    TRT_CHECK(convert_axis(axis, nbDims));
+
+    // Check if slice is valid
+    ASSERT(steps[i] != 0, ErrorCode::kINVALID_VALUE);
+    sliceStride.d[axis] = steps[i];
+
+    // Calculate start index
+    // Support for negative indexing
+    if(starts[i] < 0)
+    {
+      sliceStart.d[axis] = std::max(dims.d[i] + static_cast<int>(starts[i]), 0);
+    }
+    else
+    {
+      sliceStart.d[axis] = std::min(static_cast<int>(starts[i]), dims.d[i] - 1);
+    }
+
+    // Calculate end index
+    // Support for negative indexing
+    if(ends[i] < 0)
+    {
+      // Differs from start because starts is inclusive and ends is exclusive
+      sliceEnd.d[axis] = std::max(dims.d[i] + static_cast<int>(ends[i]), -1);
+    }
+    else
+    {
+      sliceEnd.d[axis] = std::min(static_cast<int>(ends[i]), dims.d[i]);
+    }
+
+    sliceSize.d[axis] = std::max(static_cast<int>(std::ceil(static_cast<float>(sliceEnd.d[axis] - sliceStart.d[axis]) / steps[i])), 0);
+  }
   // If entire slice op was a no-op, simply return the input tensor
-  if (sliceStart == makeDims(0) && sliceSize == dims)
+  if (sliceSize == makeDims(0))
   {
     return {{&tensor}};
+  }
+  else
+  {
+    // Slice layer can't handle size of 0
+    for (size_t i = 0; i < axes.size(); i++)
+    {
+        ASSERT(sliceSize.d[i] != 0, ErrorCode::kINVALID_VALUE);
+    }
   }
   RETURN_FIRST_OUTPUT(ctx->network()->addSlice(tensor, sliceStart, sliceSize, sliceStride));
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(Softmax) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
   OnnxAttrs attrs(node);
   int axis = attrs.get("axis", 1);
-  int ndim = inputs.at(0).shape().nbDims;
-  TRT_CHECK(convert_axis(axis, ndim));
-  nvinfer1::ITensor* tensor_ptr = &inputs.at(0).tensor();
+  ASSERT(axis != BATCH_DIM, ErrorCode::kUNSUPPORTED_NODE);
+  int nbDims = inputs.at(0).shape().nbDims;
+  TRT_CHECK(convert_axis(axis, nbDims));
+  nvinfer1::ITensor* tensor_ptr = &convertToTensor(inputs.at(0), ctx);
   nvinfer1::Dims shape = tensor_ptr->getDimensions();
-  // Reshape the tensor so that the softmax axis is 0
+  // Reshape the tensor so that the softmax axis is 0 for TensorRT to understand
   if (axis > 0)
   {
     ASSERT(tensor_ptr = flatten_tensor(ctx, *tensor_ptr, axis), ErrorCode::kUNSUPPORTED_NODE);
@@ -2652,7 +2628,7 @@ DEFINE_BUILTIN_OP_IMPORTER(Softmax) {
   auto* layer = ctx->network()->addSoftMax(*tensor_ptr);
   ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
   tensor_ptr = layer->getOutput(0);
-  // Reshape the tensor back if it was reshaped above
+  // Reshape the tensor back to original shape
   if (axis > 0)
   {
     ASSERT(tensor_ptr = move_tensor_dimension(ctx, *tensor_ptr, 0, axis), ErrorCode::kUNSUPPORTED_NODE);
@@ -2661,24 +2637,16 @@ DEFINE_BUILTIN_OP_IMPORTER(Softmax) {
   return {{tensor_ptr}};
 }
 
-//sds:Ìí¼Óonnx-tensorrt×Ô¶¨ÒåËã×ÓµÄÁ½ÖÖ·½·¨
-//    (1)activationHelperÀàËÆ£¬×ª»¯ÎªnvinferÄÚÖÃlayer
-//    (2)ÀàËÆÓÚsplit,×Ô¶¨ÒåpluginµÄ·½Ê½¡£È»ºó°Ñop×ªÎª¸ÃpluginµÄ·½Ê½¡£
 DEFINE_BUILTIN_OP_IMPORTER(Softplus) {
-    ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-	//sds:×ª»¯ÎªTensorRTµÄÄÚÖÃlayer·½·¨
     return activationHelper(ctx, node, inputs, nvinfer1::ActivationType::kSOFTPLUS);
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(Softsign) {
-    ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
     return activationHelper(ctx, node, inputs, nvinfer1::ActivationType::kSOFTSIGN);
 }
 
-#if NV_TENSORRT_MAJOR >= 4
 DEFINE_BUILTIN_OP_IMPORTER(SpaceToDepth) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor* tensor_ptr = &inputs.at(0).tensor();
+  nvinfer1::ITensor* tensor_ptr = &convertToTensor(inputs.at(0), ctx);
   nvinfer1::IShuffleLayer* layer = ctx->network()->addShuffle(*tensor_ptr);
   ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
   OnnxAttrs attrs(node);
@@ -2715,17 +2683,13 @@ DEFINE_BUILTIN_OP_IMPORTER(SpaceToDepth) {
   dims = tensor_ptr->getDimensions();
   return {{tensor_ptr}};
 }
-#endif // NV_TENSORRT_MAJOR >= 4
 
 // TODO: Legacy op for pre-1.0 ONNX spec; can be removed at some point
 DEFINE_BUILTIN_OP_IMPORTER(SpatialBN) {
   return importBatchNormalization(ctx, node, inputs);
 }
 
-//sds:node, inputs, ctx ; outputs
-//sds:split, °²×°ÒªÇó·Ö¸î³Én·Ý¡£
 DEFINE_BUILTIN_OP_IMPORTER(Split) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
   ASSERT(inputs.size() == 1, ErrorCode::kUNSUPPORTED_NODE);
   nvinfer1::Dims dims = inputs.at(0).shape();
   int nbDims = dims.nbDims;
@@ -2741,15 +2705,9 @@ DEFINE_BUILTIN_OP_IMPORTER(Split) {
     ASSERT(dims.d[axis] % noutput == 0, ErrorCode::kINVALID_NODE);
     output_lengths.assign(noutput, dims.d[axis] / noutput);
   }
-  //sds,Í¨¹ýsplit²å¼þµÄÐÎÊ½´æ´¢ÔÚengineÖÐ¡£ÎªÊ²Ã´ÕâÑùÄØ?(ÒòÎªplugin¶ÔÏóÖ§³ÖÐòÁÐ»¯
-  //ºÍ·´ÐòÁÐ»¯µÈº¯Êý¡£)
-  //¶Ô±Ècaffe plugin, ÐèÒªÍ¨¹ýpluginFactory¹¤³§À´¹ýÂËÃ¿¸öcaffe.prototxtµÄlayernameÅÐ¶ÏÊÇ·ñ´´½¨plugin¡£
-  //onnxÔò¿ÉÒÔÖ§³Ö(1)Ö±½Óbuildin_opµÄ·½Ê½¡£¸ù¾Ýop name µÄbuild inÈë¿Ú´´½¨plugin¡£          
-  //               (2)ÀàËÆÍ¨ÓÃplugin£¬Ö±½ÓÍ¨¹ýpluginCreatorµÄcreatePluginÈë¿Ú´´½¨(createPlugin(const char* name, const nvinfer1::PluginFieldCollection* fc))
-  //               (ÔÝ²»Ö§³Ö£¬ºóÐø¿ÉÒÔÔÚÃ¿¸öbuild inÈë¿ÚµÄ×î¿ªÊ¼ÏÈ×ßcreatePluginµÄ·½Ê½Ö§³Ö)
   nvinfer1::IPluginV2Layer* layer =
       ctx->addPluginV2(new SplitPlugin(axis, output_lengths),
-                     {&inputs.at(0).tensor()});
+                     {&convertToTensor(inputs.at(0), ctx)});
   ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
   ASSERT(layer->getNbOutputs() == noutput, ErrorCode::kINTERNAL_ERROR);
   std::vector<TensorOrWeights> outputs;
@@ -2763,10 +2721,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Sqrt) {
   return apply_unary_function(ctx, inputs.at(0), nvinfer1::UnaryOperation::kSQRT);
 }
 
-#if NV_TENSORRT_MAJOR >= 4
 DEFINE_BUILTIN_OP_IMPORTER(Squeeze) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor& tensor = inputs.at(0).tensor();
+  nvinfer1::ITensor& tensor = convertToTensor(inputs.at(0), ctx);
   nvinfer1::Dims old_shape = tensor.getDimensions();
   int ndim_in = old_shape.nbDims;
   OnnxAttrs attrs(node);
@@ -2785,13 +2741,7 @@ DEFINE_BUILTIN_OP_IMPORTER(Squeeze) {
     if( !axes_set.count(i) ) {
       new_shape.d[j++] = old_shape.d[i];
     } else {
-      //sds-temp, onnxÒªÇó£¬Èç¹ûaxis = a,µ«aÕâ¸öÖáµÄdNum²»ÊÇ1£¬ÄÇÃ´Ôò²»×÷´¦Àí
-      //ASSERT(old_shape.d[i] == 1, ErrorCode::kINVALID_NODE);
-      if(old_shape.d[i] != 1)
-      {
-          new_shape.d[j++] = old_shape.d[i];
-          new_shape.nbDims +=1;
-      }
+      ASSERT(old_shape.d[i] == 1, ErrorCode::kINVALID_NODE);
     }
   }
   nvinfer1::IShuffleLayer* layer = ctx->network()->addShuffle(tensor);
@@ -2801,13 +2751,12 @@ DEFINE_BUILTIN_OP_IMPORTER(Squeeze) {
          get_shape_size(old_shape), ErrorCode::kUNSUPPORTED_NODE);
   RETURN_FIRST_OUTPUT(layer);
 }
-#endif // NV_TENSORRT_MAJOR >= 4
 
 DECLARE_BUILTIN_OP_IMPORTER(Add);
 DEFINE_BUILTIN_OP_IMPORTER(Sub) {
   ASSERT(inputs.size() == 2, ErrorCode::kINVALID_NODE);
   return combineTensorsElementwise(
-      ctx, node, inputs, nvinfer1::ElementWiseOperation::kSUB, true);
+    ctx, node, inputs, nvinfer1::ElementWiseOperation::kSUB, true);
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(Sum) {
@@ -2821,42 +2770,44 @@ DEFINE_BUILTIN_OP_IMPORTER(Tan)
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(Tanh) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  RETURN_FIRST_OUTPUT(
-    ctx->network()->addActivation(
-      inputs.at(0).tensor(), nvinfer1::ActivationType::kTANH));
+    return activationHelper(ctx, node, inputs, nvinfer1::ActivationType::kTANH);
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(ThresholdedRelu) {
-    ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
     OnnxAttrs attrs(node);
     float alpha = attrs.get<float>("alpha", 1.f);
     return activationHelper(ctx, node, inputs, nvinfer1::ActivationType::kTHRESHOLDED_RELU, &alpha);
 }
 
-#if NV_TENSORRT_MAJOR >= 4
-DEFINE_BUILTIN_OP_IMPORTER(TopK) {
-  // TensorRT 5.1 only supports up to opset 9.
-  ASSERT(ctx->getOpsetVersion() < 10, ErrorCode::kUNSUPPORTED_NODE);
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor& tensor = inputs.at(0).tensor();
-  ASSERT(tensor.getType() != nvinfer1::DataType::kINT32,
-         ErrorCode::kUNSUPPORTED_NODE);
-  OnnxAttrs attrs(node);
-  ASSERT(attrs.count("k"), ErrorCode::kINVALID_NODE);
-  int k    = attrs.get<int>("k");
-  int axis = attrs.get("axis", -1);
-  int nbDims = tensor.getDimensions().nbDims;
-  // Adjust axis to TensorRT format
-  TRT_CHECK(convert_axis(axis, nbDims));
+DEFINE_BUILTIN_OP_IMPORTER(TopK)
+{
+    ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
+    nvinfer1::ITensor& tensor = inputs.at(0).tensor();
+    ASSERT(tensor.getType() != nvinfer1::DataType::kINT32, ErrorCode::kUNSUPPORTED_NODE);
+    OnnxAttrs attrs(node);
+    int axis = attrs.get("axis", -1);
+    int k;
+    // Don't support TopK with k as a tensor
+    if(ctx->getOpsetVersion() >= 10)
+    {
+      ASSERT(inputs.at(1).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
+      ASSERT(inputs.at(1).weights().count() == 1, ErrorCode::kUNSUPPORTED_NODE);
+      k = *static_cast<int*>(inputs.at(1).weights().values);
+    }
+    else
+    {
+      ASSERT(attrs.count("k"), ErrorCode::kINVALID_NODE);
+      k = attrs.get<int>("k");
+    }
 
-  uint32_t axis_mask = 1 << axis;
-  auto* layer = ctx->network()->addTopK(
-      tensor, nvinfer1::TopKOperation::kMAX, k, axis_mask);
-  ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
-  return {{layer->getOutput(0), layer->getOutput(1)}};
+    int nbDims = tensor.getDimensions().nbDims;
+    TRT_CHECK(convert_axis(axis, nbDims));
+
+    uint32_t axisMask = 1 << axis;
+    nvinfer1::ITopKLayer* layer = ctx->network()->addTopK(tensor, nvinfer1::TopKOperation::kMAX, k, axisMask);
+    ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
+    return {{layer->getOutput(0), layer->getOutput(1)}};
 }
-#endif // NV_TENSORRT_MAJOR >= 4
 
 DEFINE_BUILTIN_OP_IMPORTER(Transpose) {
   TensorOrWeights input = inputs.at(0);
@@ -2920,13 +2871,7 @@ bool  unsqueeze_scalar(IImporterContext* ctx, std::vector<TensorOrWeights>& inpu
 
     return true;
 }
-
-  
- 
-
-#if NV_TENSORRT_MAJOR >= 4
 DEFINE_BUILTIN_OP_IMPORTER(Unsqueeze) {
-
   //Begin: added by shendasai for output is scalar case, 2019Äê8ÔÂ23ÈÕ14:03:19.
   bool isOutScalar =false;
   ShapedWeights newWeights;
@@ -2936,91 +2881,166 @@ DEFINE_BUILTIN_OP_IMPORTER(Unsqueeze) {
       return {{newWeights}};
   }
   //End: added by shendasai for input is scalar case, 2019Äê8ÔÂ23ÈÕ14:03:19.
+    nvinfer1::ITensor& tensor = convertToTensor(inputs.at(0), ctx);
+    nvinfer1::Dims old_shape = tensor.getDimensions();
+    int ndim_in = old_shape.nbDims;
+    OnnxAttrs attrs(node);
+    auto axes = attrs.get<std::vector<int>>("axes");
+    std::set<int> axes_set(axes.begin(), axes.end());
+    int ndim_out = ndim_in + axes_set.size();
+    ASSERT(ndim_out <= nvinfer1::Dims::MAX_DIMS, ErrorCode::kUNSUPPORTED_NODE);
+    nvinfer1::Dims new_shape;
+    new_shape.nbDims = ndim_out;
 
-  
-  nvinfer1::ITensor& tensor = convertToTensor(inputs.at(0), ctx);
-  nvinfer1::Dims old_shape = tensor.getDimensions();
-  int ndim_in = old_shape.nbDims;
-  OnnxAttrs attrs(node);
-  auto axes = attrs.get<std::vector<int>>("axes");
-  // If the input was already a tensor, then we're dealing with a TRT shape,
-  // so subtract 1 from the axes. Otherwise, this is an ONNX shape.
-  if (inputs.at(0).is_tensor())
-  {
-      for (auto& axis : axes)
-      {
+    // If the input was already a tensor, then we're dealing with a TRT shape,
+    // so subtract 1 from the axes. Otherwise, this is an ONNX shape.
+    if (inputs.at(0).is_tensor())
+    {
+        for (auto& axis : axes)
+        {
           //sds-temp,ÏÂÃæ×¢ÊÍµô
           #if 0
           ASSERT(axis != BATCH_DIM, ErrorCode::kUNSUPPORTED_NODE);//²»ÄÜÊÇ0
           --axis;//ÖáÒÀ´Î-1
           #endif
-          
-      }
-  }
+        }
+    }
 
-  std::set<int> axes_set(axes.begin(), axes.end());
-  int ndim_out = ndim_in + axes_set.size();
-  ASSERT(ndim_out <= nvinfer1::Dims::MAX_DIMS, ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::Dims new_shape;
-  new_shape.nbDims = ndim_out;
+    for (int i = 0, j = 0; j < new_shape.nbDims; ++j )
+    {
+        if( !axes_set.count(j) )
+        {
+            new_shape.d[j] = old_shape.d[i++];
+        }
+        else
+        {
+            new_shape.d[j] = 1;
+        }
+    }
 
-  for (int i = 0, j = 0; j < new_shape.nbDims; ++j )
-  {
-      if( !axes_set.count(j) )
-      {
-          new_shape.d[j] = old_shape.d[i++];
-      }
-      else
-      {
-          new_shape.d[j] = 1;
-      }
-  }
-  nvinfer1::IShuffleLayer* layer = ctx->network()->addShuffle(tensor);
-  ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
-  layer->setReshapeDimensions(new_shape);
-  ASSERT(get_shape_size(layer->getOutput(0)->getDimensions()) == get_shape_size(old_shape),
-      ErrorCode::kUNSUPPORTED_NODE);
-  RETURN_FIRST_OUTPUT(layer);
+    nvinfer1::IShuffleLayer* layer = ctx->network()->addShuffle(tensor);
+    ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
+    layer->setReshapeDimensions(new_shape);
+    ASSERT(get_shape_size(layer->getOutput(0)->getDimensions()) == get_shape_size(old_shape),
+        ErrorCode::kUNSUPPORTED_NODE);
+    RETURN_FIRST_OUTPUT(layer);
 }
-#endif // NV_TENSORRT_MAJOR >= 4
+
+#if NV_TENSORRT_MAJOR >= 6
+DEFINE_BUILTIN_OP_IMPORTER(Resize) {
+    // Retrieve and validate input tensor
+    nvinfer1::ITensor& input = convertToTensor(inputs.at(0), ctx);
+    int input_dims = input.getDimensions().nbDims;
+    ASSERT(input_dims > 0, ErrorCode::kUNSUPPORTED_NODE);
+
+    OnnxAttrs attrs(node);
+
+    // Retrive and validate scale factors.
+    // Scale factors include batch dimensions as well.
+    ASSERT(inputs.size() == 2, ErrorCode::kINVALID_NODE);
+    auto scales = inputs.at(1);
+    ASSERT(scales.is_weights(), ErrorCode::kUNSUPPORTED_NODE);
+    ShapedWeights scales_weights = scales.weights();
+    ASSERT(scales_weights.shape.nbDims == 1, ErrorCode::kUNSUPPORTED_NODE);
+    // Effective scales_count i.e. drop count by 1 to match input dims.
+    int scales_count = scales_weights.count() - 1;
+    ASSERT(scales_count == input_dims, ErrorCode::kUNSUPPORTED_NODE);
+    ASSERT(scales_weights.type == ::ONNX_NAMESPACE::TensorProto::FLOAT, ErrorCode::kINVALID_NODE);
+
+    // Get floating point scale factors.
+    float const *scales_ptr = static_cast<float const*>(scales_weights.values);
+
+    // Add resize layer
+    nvinfer1::IResizeLayer* layer = ctx->network()->addResize(input);
+
+    // Set resize mode
+    auto mode = attrs.get<std::string>("mode", "nearest");
+    ASSERT(mode == "nearest" || mode == "linear", ErrorCode::kUNSUPPORTED_NODE);
+    // Set default resize mode. Nearest resize support N-D (where 0 < N <= 8) resize.
+    nvinfer1::ResizeMode resizeMode = nvinfer1::ResizeMode::kNEAREST;
+    if (mode == "linear")
+    {
+        // Linear resize support 1-D, 2-D and 3D resize.
+        resizeMode = nvinfer1::ResizeMode::kLINEAR;
+    }
+    layer->setResizeMode(resizeMode);
+
+    // Set resize scales
+    int num_scales = input_dims;
+    std::vector<float> scale_factors(num_scales, 1.0f);
+    // Number of scale factors equals input dimensions
+    // Exclude batch dimension scales here.
+    // TODO: Update how we validate and set scales when
+    // TensorRT drop supports full dims.
+    for (int i = 0; i < num_scales; ++i)
+    {
+      scale_factors[i] = scales_ptr[i+1];
+    }
+    layer->setScales(scale_factors.data(), num_scales);
+
+    // Set other attributes. ONNX spec does not have this attribute yet.
+    // Default: False. Set it any way.
+    layer->setAlignCorners(false);
+
+    // Return layer output
+    RETURN_FIRST_OUTPUT(layer);
+}
+#endif
 
 DEFINE_BUILTIN_OP_IMPORTER(Upsample) {
-  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor &tensor = inputs.at(0).tensor();
-  ASSERT(tensor.getDimensions().nbDims == 3, ErrorCode::kUNSUPPORTED_NODE);
+  // Retrieve and validate input tensor
+  nvinfer1::ITensor &tensor = convertToTensor(inputs.at(0), ctx);
+  const int nbDims = tensor.getDimensions().nbDims;
+  // Input tensor has no batch dimension.
+  const int nbSpatialDims = nbDims - 1;
+  ASSERT(nbSpatialDims == 2 || nbSpatialDims == 3, ErrorCode::kUNSUPPORTED_NODE);
   OnnxAttrs attrs(node);
-  float height_scale, width_scale;
+  // Resize layer needs scale factors size equals input tensor dims.
+  const int num_scales = nbDims;
+  std::vector<float> scale_factors(num_scales, 1.0f);
   if (ctx->getOpsetVersion() >= 9) {
+    // Get scale factors from inputs[1]
     ASSERT(inputs.size() == 2, ErrorCode::kINVALID_NODE);
     auto scales_input = inputs.at(1);
+    // Retrieve and validate scale factors.
     ASSERT(scales_input.is_weights(), ErrorCode::kUNSUPPORTED_NODE);
     ShapedWeights scales_weights = scales_input.weights();
     ASSERT(scales_weights.shape.nbDims == 1, ErrorCode::kUNSUPPORTED_NODE);
-    ASSERT(scales_weights.count() == 4, ErrorCode::kUNSUPPORTED_NODE);
+    // Scale factors has batch dimension.
+    ASSERT(static_cast<int>(scales_weights.count()) == num_scales + 1, ErrorCode::kUNSUPPORTED_NODE);
     ASSERT(scales_weights.type == ::ONNX_NAMESPACE::TensorProto::FLOAT,
            ErrorCode::kINVALID_NODE);
     float const *scales_ptr = static_cast<float const *>(scales_weights.values);
-    ASSERT(scales_ptr[0] == 1 && scales_ptr[1] == 1,
-           ErrorCode::kUNSUPPORTED_NODE);
-    height_scale = scales_ptr[2];
-    width_scale = scales_ptr[3];
-  } else {
-    if (!attrs.count("scales")) {
-      height_scale = attrs.get<float>("height_scale");
-      width_scale = attrs.get<float>("width_scale");
-    } else {
-      auto scales = attrs.get<std::vector<float>>("scales");
-      ASSERT(scales.size() == 4, ErrorCode::kUNSUPPORTED_NODE);
-      ASSERT(scales[0] == 1 && scales[1] == 1, ErrorCode::kUNSUPPORTED_NODE);
-      height_scale = scales[2];
-      width_scale = scales[3];
+    for(int i = 0; i < num_scales; i++){
+      scale_factors[i] = scales_ptr[i + 1];
+    }
+  } 
+  else 
+  {
+    ASSERT(attrs.count("scales"), ErrorCode::kUNSUPPORTED_NODE);
+    // Get scale factors from OnnxAttrs.
+    auto scales = attrs.get<std::vector<float>>("scales");
+    // Scale factors has batch dimension.
+    ASSERT(static_cast<int>(scales.size()) == nbDims, ErrorCode::kUNSUPPORTED_NODE);
+    for (int i = 0; i < nbDims; i++)
+    {
+        scale_factors[i] = scales[i];
     }
   }
-  auto scale = {height_scale, width_scale};
   auto mode = attrs.get<std::string>("mode", "nearest");
-  ASSERT(mode == "nearest", ErrorCode::kUNSUPPORTED_NODE);
-  RETURN_FIRST_OUTPUT(
-      ctx->addPluginV2(new ResizeNearestPlugin(scale), {&inputs.at(0).tensor()}));
+  ASSERT(mode == "nearest" || mode == "linear", ErrorCode::kUNSUPPORTED_NODE);
+  // Set default resize mode. Nearest resize support N-D (where 0 < N <= 8) resize.
+  nvinfer1::ResizeMode resizeMode = nvinfer1::ResizeMode::kNEAREST;
+  if (mode == "linear")
+  {
+      // Linear resize support 1-D, 2-D and 3D resize.
+      resizeMode = nvinfer1::ResizeMode::kLINEAR;
+  }
+  // Add resize layer
+  nvinfer1::IResizeLayer* const layer = ctx->network()->addResize(tensor);
+  layer->setScales(scale_factors.data(), num_scales);
+  layer->setResizeMode(resizeMode);
+  RETURN_FIRST_OUTPUT(layer);
 }
 
 } // namespace

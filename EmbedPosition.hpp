@@ -77,6 +77,7 @@ public:
   EmbedPositionPlugin(void const* serialData, size_t serialLength) {
     this->deserialize(serialData, serialLength);
   }
+  virtual ~EmbedPositionPlugin() {}
   virtual const char* getPluginType() const override { return EMBEDPOSITION_PLUGIN_NAME; }
 
   virtual void destroy() override {if(_lensOfDim!=nullptr)cudaFree(_lensOfDim);  if(_mulOfSon!=nullptr)cudaFree(_mulOfSon);delete this; }

@@ -29,6 +29,7 @@
 #include <NvInfer.h>
 #include <cassert>
 #include <cmath>
+#include <algorithm>
 
 namespace onnx2trt {
 
@@ -131,9 +132,6 @@ add_perm_value(nvinfer1::Permutation & perm) {
   }
   return new_perm;
 }
-
-
-
 inline nvinfer1::Dims squeeze_trailing_dims(nvinfer1::Dims const& dims) {
   nvinfer1::Dims new_dims = dims;
   // Note: TRT requires at least one dimension, so we don't squeeze [1]->[]
@@ -141,6 +139,14 @@ inline nvinfer1::Dims squeeze_trailing_dims(nvinfer1::Dims const& dims) {
     --new_dims.nbDims;
   }
   return new_dims;
+}
+
+inline nvinfer1::Dims squeeze_leading_dims(const nvinfer1::Dims& dims) {
+    nvinfer1::Dims newDims;
+    // Copy dims only if a non-1 has been seen already.
+    bool non1Seen{false};
+    newDims.nbDims = std::copy_if(dims.d, dims.d + dims.nbDims, newDims.d, [&non1Seen](int x) { non1Seen = (x != 1) ? true : non1Seen; return non1Seen; }) - newDims.d;
+    return newDims;
 }
 
 inline nvinfer1::Dims set_dims_CHW(nvinfer1::Dims const& dims) {
@@ -183,7 +189,7 @@ inline TensorOrWeights identity(IImporterContext* ctx,
   if( input.is_weights() ) {
     return input;
   } else {
-    auto* layer = ctx->network()->addShuffle(input.tensor());
+    auto* layer = ctx->network()->addIdentity(input.tensor());
     if( !layer ) {
       return nullptr;
     }

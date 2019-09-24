@@ -17,7 +17,7 @@
  # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
  # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  # DEALINGS IN THE SOFTWARE.
-
+#add_definitions(-D_GLIBCXX_USE_CXX11_ABI=0)
 cmake_minimum_required(VERSION 3.2 FATAL_ERROR)
 # The version of CMake which is not compatible with the old CUDA CMake commands.
 set(CMAKE_VERSION_THRESHOLD "3.10.0")
@@ -45,7 +45,7 @@ set(CMAKE_CXX_STANDARD  11)
 
 # Enable compiler warnings
 if ( CMAKE_COMPILER_IS_GNUCC )
-    set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -Wall")
+    set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -Wall -Wno-deprecated-declarations -Wno-unused-function -Wno-unused-but-set-variable")
 endif()
 if ( MSVC )
     set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} /W4")
@@ -60,9 +60,9 @@ set(RUNTIME_LINKER_SCRIPT ${ONNX2TRT_ROOT}/libnvonnxparser_runtime.version)
 #--------------------------------------------------
 # Version information
 #--------------------------------------------------
-set(ONNX2TRT_MAJOR 0)
-set(ONNX2TRT_MINOR 1)
-set(ONNX2TRT_PATCH 0)
+set(ONNX2TRT_MAJOR 6)
+set(ONNX2TRT_MINOR 0)
+set(ONNX2TRT_PATCH 1)
 
 #--------------------------------------------------
 # Build configurations, global to all projects
@@ -82,6 +82,7 @@ set(PLUGIN_SOURCES
   Print.cu
   QKVToContextPlugin.cu
   SkipLayerNormPlugin.cu
+  EmbedPosition.cu
   plugin.cpp
   )
 
@@ -171,6 +172,7 @@ if(${CMAKE_VERSION} VERSION_LESS ${CMAKE_VERSION_THRESHOLD})
     -lineinfo \
     -g \
     --expt-extended-lambda \
+    -Xcompiler -Wno-deprecated-declarations \
     ${GENCODES} \
     ")
   
@@ -186,6 +188,7 @@ else()
     -lineinfo \
     -g \
     --expt-extended-lambda \
+    -Xcompiler -Wno-deprecated-declarations \
     ${GENCODES} \
     ")
 
@@ -203,7 +206,7 @@ set(CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
 
 # CUDNN
 #set(CUDNN_ROOT_DIR "" CACHE PATH "Folder contains NVIDIA cuDNN")
-set(CUDNN_ROOT_DIR "/home/odin/shendasai/CUDNN")
+set(CUDNN_ROOT_DIR "/home/odin/shendasai/CUDNN_7.6.3")
 find_path(CUDNN_INCLUDE_DIR cudnn.h
     HINTS ${CUDNN_ROOT_DIR} ${CUDA_TOOLKIT_ROOT_DIR}
     PATH_SUFFIXES cuda/include include)
@@ -242,7 +245,8 @@ message("sds-tensorrt-library:"${TENSORRT_LIBRARY})
 
 set(CUBLAS_LIBRARY "/usr/local/cuda/lib64/libcublas.so")
 set(CUDA_INCLUDE_DIRS "/usr/local/cuda/include")
-set(CUB_INCLUDE_DIRS "/home/odin/shendasai/onnx/onnx-tensorrt-master2/onnx-tensorrt/")
+set(PROTOBUF_INCLUDE_DIRS "/root/anaconda3/include/")
+set(CUB_INCLUDE_DIRS "/home/odin/shendasai/onnx6/onnx-tensorrt-nodynamic/onnx-tensorrt/")
 # --------------------------------
 # Plugin library
 # --------------------------------
@@ -254,14 +258,15 @@ else()
   include_directories(${CUDNN_INCLUDE_DIR} ${TENSORRT_INCLUDE_DIR})
   add_library(nvonnxparser_plugin STATIC ${PLUGIN_SOURCES})
 endif()
-target_include_directories(nvonnxparser_plugin PUBLIC ${CUB_INCLUDE_DIRS} ${CUDA_INCLUDE_DIRS} ${ONNX_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR} ${CUDNN_INCLUDE_DIR})
+target_include_directories(nvonnxparser_plugin PUBLIC ${CUB_INCLUDE_DIRS} ${CUDA_INCLUDE_DIRS} ${ONNX_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR} ${CUDNN_INCLUDE_DIR} ${PROTOBUF_INCLUDE_DIRS})
 target_link_libraries(nvonnxparser_plugin ${TENSORRT_LIBRARY} ${CUBLAS_LIBRARY})
 
 # --------------------------------
 # Importer library
 # --------------------------------
 add_library(nvonnxparser SHARED ${IMPORTER_SOURCES})
-target_include_directories(nvonnxparser PUBLIC ${CUDA_INCLUDE_DIRS} ${ONNX_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR} ${CUDNN_INCLUDE_DIR})
+message("sds libprotobuf:"${PROTOBUF_LIBRARY})
+target_include_directories(nvonnxparser PUBLIC ${CUDA_INCLUDE_DIRS} ${ONNX_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR} ${CUDNN_INCLUDE_DIR} ${PROTOBUF_INCLUDE_DIRS})
 target_link_libraries(nvonnxparser PUBLIC onnx_proto nvonnxparser_plugin ${PROTOBUF_LIBRARY} ${CUDNN_LIBRARY} ${TENSORRT_LIBRARY})
 set_target_properties(nvonnxparser PROPERTIES
   VERSION   ${ONNX2TRT_MAJOR}.${ONNX2TRT_MINOR}.${ONNX2TRT_PATCH}
@@ -270,14 +275,14 @@ set_target_properties(nvonnxparser PROPERTIES
   LINK_FLAGS "-Wl,--version-script=${PARSER_LINKER_SCRIPT}"
 )
 add_library(nvonnxparser_static STATIC ${IMPORTER_SOURCES})
-target_include_directories(nvonnxparser_static PUBLIC ${CUDA_INCLUDE_DIRS} ${ONNX_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR} ${CUDNN_INCLUDE_DIR})
+target_include_directories(nvonnxparser_static PUBLIC ${CUDA_INCLUDE_DIRS} ${ONNX_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR} ${CUDNN_INCLUDE_DIR} ${PROTOBUF_INCLUDE_DIRS})
 target_link_libraries(nvonnxparser_static PUBLIC onnx_proto nvonnxparser_plugin ${PROTOBUF_LIBRARY} ${CUDNN_LIBRARY} ${TENSORRT_LIBRARY})
 
 # --------------------------------
 # Runtime library
 # --------------------------------
 add_library(nvonnxparser_runtime SHARED ${RUNTIME_SOURCES})
-target_include_directories(nvonnxparser_runtime PUBLIC ${CUDA_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR} ${CUDNN_INCLUDE_DIR})
+target_include_directories(nvonnxparser_runtime PUBLIC ${CUDA_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR} ${CUDNN_INCLUDE_DIR} ${PROTOBUF_INCLUDE_DIRS})
 target_link_libraries(nvonnxparser_runtime PUBLIC nvonnxparser_plugin ${CUDNN_LIBRARY} ${TENSORRT_LIBRARY})
 set_target_properties(nvonnxparser_runtime PROPERTIES
   VERSION   ${ONNX2TRT_MAJOR}.${ONNX2TRT_MINOR}.${ONNX2TRT_PATCH}
@@ -286,14 +291,14 @@ set_target_properties(nvonnxparser_runtime PROPERTIES
   LINK_FLAGS "-Wl,--version-script=${RUNTIME_LINKER_SCRIPT}"
 )
 add_library(nvonnxparser_runtime_static STATIC ${RUNTIME_SOURCES})
-target_include_directories(nvonnxparser_runtime_static PUBLIC ${CUDA_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR} ${CUDNN_INCLUDE_DIR})
+target_include_directories(nvonnxparser_runtime_static PUBLIC ${CUDA_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR} ${CUDNN_INCLUDE_DIR} ${PROTOBUF_INCLUDE_DIRS})
 target_link_libraries(nvonnxparser_runtime_static PUBLIC nvonnxparser_plugin ${CUDNN_LIBRARY} ${TENSORRT_LIBRARY})
 
 # --------------------------------
 # Onnxifi library
 # --------------------------------
 add_library(trt_onnxify SHARED ${ONNXIFI_SOURCES})
-target_include_directories(trt_onnxify PUBLIC ${CUDA_INCLUDE_DIRS} ${ONNX_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR} ${CUDNN_INCLUDE_DIR})
+target_include_directories(trt_onnxify PUBLIC ${CUDA_INCLUDE_DIRS} ${ONNX_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR} ${CUDNN_INCLUDE_DIR} ${PROTOBUF_INCLUDE_DIRS})
 target_link_libraries(trt_onnxify PUBLIC nvonnxparser_static ${CUDA_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
 
 # --------------------------------

@@ -132,6 +132,21 @@ Status importInputs(ImporterContext* importer_ctx,
     ASSERT_INPUT(!tensors->count(input.name()), ErrorCode::kINVALID_GRAPH,input.name());
     tensors->insert({input.name(), tensor});
   }
+  
+  // According to the ONNX spec: initializers do not have to be specified as agraph input.
+  // In order for these initializers to be populated down to TRT, we need to add them to the tensors list.
+  for (auto initializer : initializer_map)
+  {
+      const std::string initializer_name = initializer.first;
+      if (!tensors->count(initializer_name))
+      {
+        const auto& initializer_weight = *initializer.second;
+        ShapedWeights weights;
+        ASSERT(convert_onnx_weights(initializer_weight, &weights), ErrorCode::kUNSUPPORTED_NODE);
+        tensors->insert({initializer_name, weights});
+      }
+  }
+
   return Status::success();
 }
 
@@ -452,12 +467,15 @@ bool ModelImporter::supportsModel(void const *serialized_onnx_model,
             sub_graph_collection.erase(sub_graph_collection.begin() + graph_index);
           }
           // Case where subgraph has more than one node and the first node is unsupported. No "split_before" graph.
+          // The split_after graph is marked as unsupported.
           else if (node_index == 0)
           {
             NodesContainer_t split_after (subgraph.begin() + node_index + 1, subgraph.end());
             sub_graph_collection[graph_index].first = split_after;
+            sub_graph_collection[graph_index].second = false;
           }
           // Case where subgraph has more than one node and the last node is unsupported. No "split_after" graph.
+          // The split_before graph is marked as supported.
           else if (node_index == subgraph.size() - 1)
           {
             NodesContainer_t split_before (subgraph.begin(), subgraph.begin() + node_index);
@@ -465,6 +483,7 @@ bool ModelImporter::supportsModel(void const *serialized_onnx_model,
             sub_graph_collection[graph_index].second = true;
           }
           // Case where unsupported node is somewhere in the middle. Split the subgraph at that point into two.
+          // Mark split_before as supported and split_after as unsupported.
           else
           {
             NodesContainer_t split_before (subgraph.begin(), subgraph.begin() + node_index);

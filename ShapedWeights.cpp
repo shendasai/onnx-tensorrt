@@ -54,14 +54,17 @@ bool convertINT642FLOAT(void* weightValues, const size_t nbWeights, std::vector<
   }
   return true;
 }
-
-
 size_t ShapedWeights::count() const {
-  if( this->shape.nbDims == 0 ) {
+  if( this->values == nullptr && this->shape.nbDims == 0 )
+  {
     return 0;
-  } else {
+  }
+  else 
+  {
+    // TRT supports scalars, so 0D tensors should have a count of 1.
     size_t c = 1;
-    for( int i=0; i<this->shape.nbDims; ++i ) {
+    for( int i=0; i<this->shape.nbDims; ++i )
+    {
       c *= this->shape.d[i];
     }
     return c;
@@ -110,7 +113,7 @@ ShapedWeights::operator nvinfer1::Weights() const {
       void * int32_weights_ptr = static_cast<void *>(int32_weights.data());
       std::memcpy(this->values, int32_weights_ptr, int32_weights.size() * sizeof(int32_t));
       w.values = this->values;
-      cout << "Successfully casted down from int64 to  INT32 in weights()." << endl;
+      cout << "Successfully casted down to INT32." << endl;
     }
   }
   

@@ -33,6 +33,7 @@ using namespace std;
 
 bool gdb_copy_to_cpu(std::string opType, float* data, int size)
 {
+  if(false) return true;
   float* _temp = (float*)malloc(size*sizeof(float));
   
   cudaError_t status = (cudaMemcpy(_temp, data, size*sizeof(float), cudaMemcpyDeviceToHost));
