@@ -40,6 +40,7 @@ See [here](https://developer.nvidia.com/cuda-gpus) for the compute capability ma
     cmake .. -DTENSORRT_ROOT=<tensorrt_install_dir>
     OR
     cmake .. -DTENSORRT_ROOT=<tensorrt_install_dir> -DGPU_ARCHS="61"
+	#cmake .. -DTENSORRT_ROOT=/home/odin/shendasai/TensorRT6/TensorRT-6.0.1.5 -DCMAKE_BUILD_TYPE=Debug
     make -j8
     sudo make install
 
